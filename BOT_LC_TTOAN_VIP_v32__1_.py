@@ -5738,4 +5738,4 @@ if __name__ == '__main__':
     print(f"  Telegram Bot : /tool (dự đoán) | /autobet (auto-cược) | /stop /stopbet")
     print("=" * 60)
 
-    web.run_app(create_app(), host='127.0.0.1', port=PORT, access_log=None)
+    web.run_app(create_app(), host='0.0.0.0', port=int(os.environ.get('PORT', PORT)), access_log=None)
