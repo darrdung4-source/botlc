@@ -27,6 +27,8 @@ TX Ensemble Tool — Python Backend (v28 - Real WS AutoBet + Exponential Win + P
          │    WR 40%–60% → vùng trung tính, không làm gì, tiếp đếm
          └─ Sau khi đổi ttoan: bộ đếm bắt đầu lại từ 0, lần check tiếp theo
             tính từ ván đầu tiên của ttoan mới (không warmup lại)
+  · v33: CONSEC LOSS BAIL — sai liên tiếp 4 ván thật → đổi ttoan ngay lập tức
+         (không cần đợi đủ TTOAN_CHECK_WINDOW, ưu tiên cao hơn WR gate)
   · v23 FIX: pred_ok được truyền đúng vào logic_tuner_update_result
              → _ttoan_tracker hoạt động chính xác (v22 bị bug: pred_ok=None nên
                tracker không bao giờ được cập nhật → WR check không bao giờ chạy)
@@ -374,10 +376,11 @@ LOGIC_TUNE_INTERVAL = 10  # v16: legacy — không dùng trực tiếp nữa (gi
 TTOAN_WR_HOLD_THRESH  = 0.60   # WR 10 ván ≥ 60% → giữ ttoan, không đổi
 TTOAN_WR_SWAP_THRESH  = 0.40   # WR 10 ván < 40% → đổi ttoan ngay lập tức
 TTOAN_CHECK_WINDOW    = 10     # số ván gần nhất để tính WR kiểm tra
+TTOAN_CONSEC_LOSS_BAIL = 4     # v33: sai liên tiếp N ván thật → đổi ttoan khẩn (không cần đủ window)
 HISTORY_SAVE_INTERVAL = 1    # lưu file sau mỗi phiên (persistent ngay lập tức)
 
 # ─── Telegram Config ──────────────────────────────────────────────────────────
-TG_TOKEN     = '8929908487:AAG7mH-P9v6ltgRo1hhqh9vSGM1MB2AvKfw'
+TG_TOKEN     = '8943843485:AAF9Lhoa6DlGidZWoy8Ok_-fd5qWqau4bSs'
 TG_API       = f'https://api.telegram.org/bot{TG_TOKEN}'
 ADMIN_ID     = 8764934889          # duy nhất, cứng
 ADMIN_USERNAME = '<a href="https://t.me/ddvipro">@ddvipro</a>'  # username admin Telegram
@@ -1261,7 +1264,41 @@ def logic_tuner_update_result(sess_id: str, actual: str, pred_ok: bool | None = 
     _ttoan_tracker['real_vans_since_swap'] += 1
     real_vans = _ttoan_tracker['real_vans_since_swap']
 
-    # 3. v26: FIRST-REAL-FAIL GATE
+    # 3. v33: CONSECUTIVE LOSS EMERGENCY GATE
+    # Nếu sai liên tiếp >= TTOAN_CONSEC_LOSS_BAIL ván thật → đổi ngay, không cần đủ window
+    if not bool(pred_ok):
+        consec_loss = 0
+        for v in reversed(_ttoan_tracker['history_since_swap']):
+            if not v:
+                consec_loss += 1
+            else:
+                break
+        if consec_loss >= TTOAN_CONSEC_LOSS_BAIL:
+            vans_done = _ttoan_tracker['vans_since_swap']
+            print(f"[TTOAN] 🚨 EMERGENCY — sai liên tiếp {consec_loss} ván thật "
+                  f"→ ĐỔI ttoan ngay (không cần đủ {TTOAN_CHECK_WINDOW} ván)!")
+            _run_logic_tune_with_window(vans_done)
+            # trim = 0 vì vừa kết thúc bằng chuỗi sai, không có đuôi đúng
+            _ttoan_tracker['vans_since_swap']      = 0
+            _ttoan_tracker['history_since_swap']   = []
+            _ttoan_tracker['pre_trim_count']       = 0
+            _ttoan_tracker['real_vans_since_swap'] = 0
+            _ttoan_tracker['last_swap_at_live']    = app_state['live_count']
+            _ttoan_tracker['swap_count']          += 1
+            _ttoan_tracker['last_swap_reason']     = 'consec_loss'
+            _logic_tuner['since_tune']             = 0
+            new_top3 = _logic_tuner['active_logics']
+            asyncio.get_event_loop().create_task(
+                _tg_notify_ttoan_swap(
+                    swap_count = _ttoan_tracker['swap_count'],
+                    vans_used  = vans_done,
+                    recent_wr  = 0.0,
+                    new_logics = new_top3,
+                )
+            )
+            return
+
+    # 3b. v26: FIRST-REAL-FAIL GATE
     # WR check chỉ được kích hoạt khi:
     #   a) Đã có ít nhất 1 ván thật (real_vans >= 1)  — luôn đúng ở đây vì vừa +1
     #   b) Ván thật vừa rồi là SAI (pred_ok == False)
@@ -2213,34 +2250,6 @@ async def tg_poll_loop():
     """Long-polling Telegram updates — full command system"""
     global tg_offset
     print("[TG] Bot polling bắt đầu...")
-
-    # ── Startup: validate token + clear webhook ───────────────────────────────
-    try:
-        async with aiohttp.ClientSession() as session:
-            # 1. Kiểm tra token hợp lệ
-            r_me = await session.get(f'{TG_API}/getMe', timeout=aiohttp.ClientTimeout(total=10))
-            me   = await r_me.json()
-            if not me.get('ok'):
-                print(f"[TG] ❌ TOKEN KHÔNG HỢP LỆ: {me} — Bot sẽ không nhận được message nào!")
-                print(f"[TG] Hãy lấy token mới từ @BotFather và cập nhật TG_TOKEN trong code.")
-            else:
-                bot_name = me['result'].get('username', 'unknown')
-                print(f"[TG] ✅ Token hợp lệ — Bot: @{bot_name}")
-
-            # 2. Xóa webhook nếu có (webhook block getUpdates)
-            r_wh = await session.post(
-                f'{TG_API}/deleteWebhook',
-                json={'drop_pending_updates': True},
-                timeout=aiohttp.ClientTimeout(total=10)
-            )
-            wh = await r_wh.json()
-            if wh.get('ok'):
-                print("[TG] ✅ Webhook cleared — polling mode active")
-            else:
-                print(f"[TG] ⚠️ deleteWebhook fail: {wh}")
-    except Exception as e:
-        print(f"[TG] ⚠️ Startup check lỗi: {e}")
-
     while True:
         try:
             async with aiohttp.ClientSession() as session:
@@ -2251,17 +2260,7 @@ async def tg_poll_loop():
                 )
                 data = await resp.json()
                 if not data.get('ok'):
-                    err_desc = data.get('description', 'unknown error')
-                    err_code = data.get('error_code', 0)
-                    print(f"[TG POLL] getUpdates failed: code={err_code} desc={err_desc}")
-                    if err_code == 401:
-                        print("[TG] ❌ TOKEN REVOKED — dừng polling. Cần cập nhật TG_TOKEN.")
-                        return  # dừng hẳn, không retry vô ích
-                    if err_code == 409:
-                        print("[TG] ⚠️ Conflict: có instance khác đang chạy cùng token. Chờ 15s...")
-                        await asyncio.sleep(15)
-                    else:
-                        await asyncio.sleep(5)
+                    await asyncio.sleep(5)
                     continue
 
                 for update in data.get('result', []):
@@ -2727,14 +2726,8 @@ async def tg_poll_loop():
         except asyncio.CancelledError:
             print("[TG] Poll task đã dừng")
             break
-        except aiohttp.ClientConnectorError as e:
-            print(f"[TG POLL] Không kết nối được Telegram API: {e} — retry 10s")
-            await asyncio.sleep(10)
-        except asyncio.TimeoutError:
-            print("[TG POLL] getUpdates timeout — retry ngay")
-            await asyncio.sleep(1)
         except Exception as e:
-            print(f"[TG POLL ERR] {type(e).__name__}: {e}")
+            print(f"[TG POLL ERR] {e}")
             await asyncio.sleep(5)
 
 
