@@ -27,10 +27,11 @@ TX Ensemble Tool — Python Backend (v28 - Real WS AutoBet + Exponential Win + P
          │    WR 40%–60% → vùng trung tính, không làm gì, tiếp đếm
          └─ Sau khi đổi ttoan: bộ đếm bắt đầu lại từ 0, lần check tiếp theo
             tính từ ván đầu tiên của ttoan mới (không warmup lại)
-  · v33: CONSEC LOSS BAIL — sai liên tiếp N ván thật → đổi ttoan ngay lập tức
+  · v33: CONSEC LOSS BAIL — sai liên tiếp 4 ván thật → đổi ttoan ngay lập tức
          (không cần đợi đủ TTOAN_CHECK_WINDOW, ưu tiên cao hơn WR gate)
-  · v34: CONSEC LOSS BAIL giảm 4→3 ván | /reloadlogic ép tune window trước reset
-         (tune theo ván thực tế đã tích, không phải toàn bộ history)
+  · v35: /reloadlogic thêm vào /help admin — admin thấy đủ lệnh
+         TTOAN_CONSEC_LOSS_BAIL = 3 (sai liên tiếp 3 ván → đổi ttoan khẩn)
+         /reloadlogic reset sạch chuỗi sai liên tiếp, không carry-over
   · v23 FIX: pred_ok được truyền đúng vào logic_tuner_update_result
              → _ttoan_tracker hoạt động chính xác (v22 bị bug: pred_ok=None nên
                tracker không bao giờ được cập nhật → WR check không bao giờ chạy)
@@ -378,7 +379,7 @@ LOGIC_TUNE_INTERVAL = 10  # v16: legacy — không dùng trực tiếp nữa (gi
 TTOAN_WR_HOLD_THRESH  = 0.60   # WR 10 ván ≥ 60% → giữ ttoan, không đổi
 TTOAN_WR_SWAP_THRESH  = 0.40   # WR 10 ván < 40% → đổi ttoan ngay lập tức
 TTOAN_CHECK_WINDOW    = 10     # số ván gần nhất để tính WR kiểm tra
-TTOAN_CONSEC_LOSS_BAIL = 3     # v34: sai liên tiếp N ván thật → đổi ttoan khẩn (không cần đủ window)
+TTOAN_CONSEC_LOSS_BAIL = 3     # v35: sai liên tiếp 3 ván thật → đổi ttoan khẩn (không cần đủ window)
 HISTORY_SAVE_INTERVAL = 1    # lưu file sau mỗi phiên (persistent ngay lập tức)
 
 # ─── Telegram Config ──────────────────────────────────────────────────────────
@@ -2713,15 +2714,29 @@ async def tg_poll_loop():
                                 '/stop — Tắt nhận dự đoán\n'
                                 '/autobet — Đăng nhập & thiết lập auto-cược LC79\n'
                                 '/stopbet — Dừng auto-cược\n'
-                                '/betstatus — Trạng thái auto-cược hiện tại\n')
+                                '/betstatus — Trạng thái auto-cược hiện tại\n\n'
+                                '🔄 <b>Reload Logic (chỉ admin)</b>\n'
+                                '/reloadlogic — Ép tool đổi ttoan + reload toàn bộ logic ngay lập tức\n'
+                                '  • Reset rolling history 9 logic (clear sạch)\n'
+                                '  • Reset active logics → re-tune từ history thật\n'
+                                '  • Reset session offset tuner\n'
+                                '  • Reset TTOAN tracker (đổi ttoan ngay, kể cả đang chuỗi thắng)\n'
+                                '  • Xóa chuỗi sai liên tiếp — không carry-over sang ttoan mới\n'
+                                '  • Reset adaptive TT1/TT2\n'
+                                '  ⚠️ User thường không thấy lệnh này')
 
                         # /reloadlogic — ép tool reload ttoan + logic mới ngay lập tức
                         elif cmd == '/reloadlogic':
                             # ── Step 1: Reset toàn bộ rolling history của 9 logic ──────
                             for name in ALL_LOGICS:
                                 _logic_tuner['history'][name].clear()
-                            _logic_tuner['since_tune']    = 0
-                            _logic_tuner['last_bench']    = None
+                            _logic_tuner['since_tune']      = 0
+                            _logic_tuner['last_bench']      = None
+                            # v34: ép reset active_logics về default để re-tune thật sự từ đầu
+                            _logic_tuner['active_logics']   = ['L1', 'L2', 'L3']
+                            _logic_tuner['reversed_logics'] = set()
+                            _logic_tuner['total_preds']     = 0
+                            _logic_tuner['pending'].clear()
 
                             # ── Step 2: Reset session offset tuner history ──────────────
                             for o in (-1, 0, 1):
@@ -2736,11 +2751,6 @@ async def tg_poll_loop():
                             _session_tuner['reversed_ns_bench']  = None
 
                             # ── Step 3: Reset ttoan tracker ────────────────────────────
-                            # v34: ép tune logic từ số ván đã tích trước khi reset
-                            # (giống consec_loss bail — tune theo window thực tế, không phải full hist)
-                            vans_before_reset = _ttoan_tracker['vans_since_swap']
-                            if vans_before_reset > 0:
-                                _run_logic_tune_with_window(vans_before_reset)
                             _ttoan_tracker['vans_since_swap']      = 0
                             _ttoan_tracker['history_since_swap']   = []
                             _ttoan_tracker['pre_trim_count']       = 0
@@ -2750,8 +2760,8 @@ async def tg_poll_loop():
                             _ttoan_tracker['last_swap_reason']     = 'manual_reload'
                             _logic_tuner['since_tune']             = 0
 
-                            # ── Step 4: Reset pending logic tuner (tránh stale snapshot) ─
-                            _logic_tuner['pending'].clear()
+                            # ── Step 4: (pending đã clear ở step 1) ─────────────────────
+                            pass
 
                             # ── Step 5: Reset adaptive history ─────────────────────────
                             _adaptive_history.clear()
@@ -2804,25 +2814,23 @@ async def tg_poll_loop():
                                         f'  {n}: <b>{eff:.1f}%</b>{rev_tag}' if eff else f'  {n}: —'
                                     )
 
-                            vans_info = (f'  • Tune từ <b>{vans_before_reset}</b> ván thực tế trước reset\n'
-                                         if vans_before_reset > 0
-                                         else '  • Chưa có ván nào → tune từ full history\n')
+                            swap_no = _ttoan_tracker['swap_count']
                             await tg_send(chat_id,
                                 f'🔄 <b>RELOAD LOGIC — Hoàn tất</b>\n'
                                 f'━━━━━━━━━━━━━━\n'
-                                f'✅ Đã reset toàn bộ:\n'
-                                f'  • Rolling history 9 logic\n'
+                                f'✅ Đã ép reset toàn bộ:\n'
+                                f'  • Rolling history 9 logic (clear sạch)\n'
+                                f'  • Active logics → reset về L1/L2/L3 rồi re-tune\n'
                                 f'  • Session offset tuner\n'
-                                f'  • TTOAN tracker (đổi ttoan ngay)\n'
+                                f'  • TTOAN tracker (lần đổi #{swap_no})\n'
                                 f'  • Adaptive TT1/TT2\n'
-                                f'  • Pending snapshots\n'
-                                + vans_info
-                                + f'\n🧠 <b>Top-3 mới (re-tune):</b>\n'
+                                f'  • Pending snapshots\n\n'
+                                f'🧠 <b>Top-3 mới (re-tune từ history):</b>\n'
                                 f'  {top3_str}\n'
                                 + ('\n'.join(wr_lines) + '\n' if wr_lines else '')
                                 + f'\n🔀 Logic BẺ chiều: {rev_str}\n'
                                 f'━━━━━━━━━━━━━━\n'
-                                f'Tool sẽ dùng ttoan mới từ phiên kế tiếp.\n'
+                                f'⚡ Tool đã ép đổi ttoan — hiệu lực từ phiên kế tiếp.\n'
                                 f'<i>(Lệnh này chỉ admin thấy)</i>')
 
                         else:
