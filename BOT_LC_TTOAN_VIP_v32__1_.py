@@ -377,7 +377,7 @@ TTOAN_CHECK_WINDOW    = 10     # số ván gần nhất để tính WR kiểm tr
 HISTORY_SAVE_INTERVAL = 1    # lưu file sau mỗi phiên (persistent ngay lập tức)
 
 # ─── Telegram Config ──────────────────────────────────────────────────────────
-TG_TOKEN     = '8943843485:AAF9Lhoa6DlGidZWoy8Ok_-fd5qWqau4bSs'
+TG_TOKEN     = '8929908487:AAG7mH-P9v6ltgRo1hhqh9vSGM1MB2AvKfw'
 TG_API       = f'https://api.telegram.org/bot{TG_TOKEN}'
 ADMIN_ID     = 8764934889          # duy nhất, cứng
 ADMIN_USERNAME = '<a href="https://t.me/ddvipro">@ddvipro</a>'  # username admin Telegram
@@ -2213,6 +2213,34 @@ async def tg_poll_loop():
     """Long-polling Telegram updates — full command system"""
     global tg_offset
     print("[TG] Bot polling bắt đầu...")
+
+    # ── Startup: validate token + clear webhook ───────────────────────────────
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 1. Kiểm tra token hợp lệ
+            r_me = await session.get(f'{TG_API}/getMe', timeout=aiohttp.ClientTimeout(total=10))
+            me   = await r_me.json()
+            if not me.get('ok'):
+                print(f"[TG] ❌ TOKEN KHÔNG HỢP LỆ: {me} — Bot sẽ không nhận được message nào!")
+                print(f"[TG] Hãy lấy token mới từ @BotFather và cập nhật TG_TOKEN trong code.")
+            else:
+                bot_name = me['result'].get('username', 'unknown')
+                print(f"[TG] ✅ Token hợp lệ — Bot: @{bot_name}")
+
+            # 2. Xóa webhook nếu có (webhook block getUpdates)
+            r_wh = await session.post(
+                f'{TG_API}/deleteWebhook',
+                json={'drop_pending_updates': True},
+                timeout=aiohttp.ClientTimeout(total=10)
+            )
+            wh = await r_wh.json()
+            if wh.get('ok'):
+                print("[TG] ✅ Webhook cleared — polling mode active")
+            else:
+                print(f"[TG] ⚠️ deleteWebhook fail: {wh}")
+    except Exception as e:
+        print(f"[TG] ⚠️ Startup check lỗi: {e}")
+
     while True:
         try:
             async with aiohttp.ClientSession() as session:
@@ -2223,7 +2251,17 @@ async def tg_poll_loop():
                 )
                 data = await resp.json()
                 if not data.get('ok'):
-                    await asyncio.sleep(5)
+                    err_desc = data.get('description', 'unknown error')
+                    err_code = data.get('error_code', 0)
+                    print(f"[TG POLL] getUpdates failed: code={err_code} desc={err_desc}")
+                    if err_code == 401:
+                        print("[TG] ❌ TOKEN REVOKED — dừng polling. Cần cập nhật TG_TOKEN.")
+                        return  # dừng hẳn, không retry vô ích
+                    if err_code == 409:
+                        print("[TG] ⚠️ Conflict: có instance khác đang chạy cùng token. Chờ 15s...")
+                        await asyncio.sleep(15)
+                    else:
+                        await asyncio.sleep(5)
                     continue
 
                 for update in data.get('result', []):
@@ -2689,8 +2727,14 @@ async def tg_poll_loop():
         except asyncio.CancelledError:
             print("[TG] Poll task đã dừng")
             break
+        except aiohttp.ClientConnectorError as e:
+            print(f"[TG POLL] Không kết nối được Telegram API: {e} — retry 10s")
+            await asyncio.sleep(10)
+        except asyncio.TimeoutError:
+            print("[TG POLL] getUpdates timeout — retry ngay")
+            await asyncio.sleep(1)
         except Exception as e:
-            print(f"[TG POLL ERR] {e}")
+            print(f"[TG POLL ERR] {type(e).__name__}: {e}")
             await asyncio.sleep(5)
 
 
