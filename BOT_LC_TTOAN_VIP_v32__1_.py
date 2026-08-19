@@ -27,8 +27,10 @@ TX Ensemble Tool — Python Backend (v28 - Real WS AutoBet + Exponential Win + P
          │    WR 40%–60% → vùng trung tính, không làm gì, tiếp đếm
          └─ Sau khi đổi ttoan: bộ đếm bắt đầu lại từ 0, lần check tiếp theo
             tính từ ván đầu tiên của ttoan mới (không warmup lại)
-  · v33: CONSEC LOSS BAIL — sai liên tiếp 4 ván thật → đổi ttoan ngay lập tức
+  · v33: CONSEC LOSS BAIL — sai liên tiếp N ván thật → đổi ttoan ngay lập tức
          (không cần đợi đủ TTOAN_CHECK_WINDOW, ưu tiên cao hơn WR gate)
+  · v34: CONSEC LOSS BAIL giảm 4→3 ván | /reloadlogic ép tune window trước reset
+         (tune theo ván thực tế đã tích, không phải toàn bộ history)
   · v23 FIX: pred_ok được truyền đúng vào logic_tuner_update_result
              → _ttoan_tracker hoạt động chính xác (v22 bị bug: pred_ok=None nên
                tracker không bao giờ được cập nhật → WR check không bao giờ chạy)
@@ -376,7 +378,7 @@ LOGIC_TUNE_INTERVAL = 10  # v16: legacy — không dùng trực tiếp nữa (gi
 TTOAN_WR_HOLD_THRESH  = 0.60   # WR 10 ván ≥ 60% → giữ ttoan, không đổi
 TTOAN_WR_SWAP_THRESH  = 0.40   # WR 10 ván < 40% → đổi ttoan ngay lập tức
 TTOAN_CHECK_WINDOW    = 10     # số ván gần nhất để tính WR kiểm tra
-TTOAN_CONSEC_LOSS_BAIL = 4     # v33: sai liên tiếp N ván thật → đổi ttoan khẩn (không cần đủ window)
+TTOAN_CONSEC_LOSS_BAIL = 3     # v34: sai liên tiếp N ván thật → đổi ttoan khẩn (không cần đủ window)
 HISTORY_SAVE_INTERVAL = 1    # lưu file sau mỗi phiên (persistent ngay lập tức)
 
 # ─── Telegram Config ──────────────────────────────────────────────────────────
@@ -2712,6 +2714,116 @@ async def tg_poll_loop():
                                 '/autobet — Đăng nhập & thiết lập auto-cược LC79\n'
                                 '/stopbet — Dừng auto-cược\n'
                                 '/betstatus — Trạng thái auto-cược hiện tại\n')
+
+                        # /reloadlogic — ép tool reload ttoan + logic mới ngay lập tức
+                        elif cmd == '/reloadlogic':
+                            # ── Step 1: Reset toàn bộ rolling history của 9 logic ──────
+                            for name in ALL_LOGICS:
+                                _logic_tuner['history'][name].clear()
+                            _logic_tuner['since_tune']    = 0
+                            _logic_tuner['last_bench']    = None
+
+                            # ── Step 2: Reset session offset tuner history ──────────────
+                            for o in (-1, 0, 1):
+                                _session_tuner['history'][o].clear()
+                            _session_tuner['since_tune']         = 0
+                            _session_tuner['last_bench']         = None
+                            _session_tuner['pending'].clear()
+                            _session_tuner['flip_mode']          = False
+                            _session_tuner['flip_since']         = 0
+                            _session_tuner['reversed_newsession'] = False
+                            _session_tuner['reversed_ns_since']  = 0
+                            _session_tuner['reversed_ns_bench']  = None
+
+                            # ── Step 3: Reset ttoan tracker ────────────────────────────
+                            # v34: ép tune logic từ số ván đã tích trước khi reset
+                            # (giống consec_loss bail — tune theo window thực tế, không phải full hist)
+                            vans_before_reset = _ttoan_tracker['vans_since_swap']
+                            if vans_before_reset > 0:
+                                _run_logic_tune_with_window(vans_before_reset)
+                            _ttoan_tracker['vans_since_swap']      = 0
+                            _ttoan_tracker['history_since_swap']   = []
+                            _ttoan_tracker['pre_trim_count']       = 0
+                            _ttoan_tracker['real_vans_since_swap'] = 0
+                            _ttoan_tracker['last_swap_at_live']    = app_state['live_count']
+                            _ttoan_tracker['swap_count']          += 1
+                            _ttoan_tracker['last_swap_reason']     = 'manual_reload'
+                            _logic_tuner['since_tune']             = 0
+
+                            # ── Step 4: Reset pending logic tuner (tránh stale snapshot) ─
+                            _logic_tuner['pending'].clear()
+
+                            # ── Step 5: Reset adaptive history ─────────────────────────
+                            _adaptive_history.clear()
+                            _adaptive_groups['TT1']        = {'3-0', 'L2L3'}
+                            _adaptive_groups['TT2']        = {'L1L2', 'L1L3'}
+                            _adaptive_groups['source']     = 'default'
+                            _adaptive_groups['computed_at'] = 0
+
+                            # ── Step 6: Force re-tune logic pakai full history ──────────
+                            # Build WR dari full history window để ngisi rolling history baru
+                            hist_w = get_history_window()
+                            if len(hist_w) >= 5:
+                                # Re-populate rolling history tiap logic dari hist_w
+                                for entry in hist_w[-LOGIC_TUNE_WINDOW:]:
+                                    sid_e  = entry.get('sess', '')
+                                    md5_e  = entry.get('md5', '')
+                                    act_e  = entry.get('result', '')
+                                    if not (sid_e and md5_e and act_e in ('TAI', 'XIU')):
+                                        continue
+                                    try:
+                                        sid_plus1 = str(int(sid_e) + 1)
+                                        X, Y, Z   = _calc_XYZ(int(sid_plus1), md5_e)
+                                        for name in ALL_LOGICS:
+                                            pred = _run_one_logic(name, X, Y, Z, md5_e)
+                                            hist = _logic_tuner['history'][name]
+                                            hist.append(pred == act_e)
+                                            if len(hist) > LOGIC_TUNE_WINDOW:
+                                                hist.pop(0)
+                                    except Exception:
+                                        continue
+
+                            # ── Step 7: Jalankan tune ulang ────────────────────────────
+                            _run_logic_tune()
+
+                            new_top3 = _logic_tuner['active_logics']
+                            new_rev  = list(_logic_tuner.get('reversed_logics', set()))
+                            print(f"[RELOADLOGIC] Admin force-reload @ live#{app_state['live_count']} "
+                                  f"→ top3={new_top3} rev={new_rev}")
+
+                            top3_str  = ' · '.join(f'<code>{l}</code>' for l in new_top3)
+                            rev_str   = (', '.join(f'<code>{l}</code>' for l in new_rev)
+                                         if new_rev else '—')
+                            bench     = _logic_tuner.get('last_bench')
+                            wr_lines  = []
+                            if bench and bench.get('eff_wr'):
+                                for n in new_top3:
+                                    eff = bench['eff_wr'].get(n)
+                                    rev_tag = ' 🔄[BẺ]' if n in (new_rev or []) else ''
+                                    wr_lines.append(
+                                        f'  {n}: <b>{eff:.1f}%</b>{rev_tag}' if eff else f'  {n}: —'
+                                    )
+
+                            vans_info = (f'  • Tune từ <b>{vans_before_reset}</b> ván thực tế trước reset\n'
+                                         if vans_before_reset > 0
+                                         else '  • Chưa có ván nào → tune từ full history\n')
+                            await tg_send(chat_id,
+                                f'🔄 <b>RELOAD LOGIC — Hoàn tất</b>\n'
+                                f'━━━━━━━━━━━━━━\n'
+                                f'✅ Đã reset toàn bộ:\n'
+                                f'  • Rolling history 9 logic\n'
+                                f'  • Session offset tuner\n'
+                                f'  • TTOAN tracker (đổi ttoan ngay)\n'
+                                f'  • Adaptive TT1/TT2\n'
+                                f'  • Pending snapshots\n'
+                                + vans_info
+                                + f'\n🧠 <b>Top-3 mới (re-tune):</b>\n'
+                                f'  {top3_str}\n'
+                                + ('\n'.join(wr_lines) + '\n' if wr_lines else '')
+                                + f'\n🔀 Logic BẺ chiều: {rev_str}\n'
+                                f'━━━━━━━━━━━━━━\n'
+                                f'Tool sẽ dùng ttoan mới từ phiên kế tiếp.\n'
+                                f'<i>(Lệnh này chỉ admin thấy)</i>')
 
                         else:
                             # admin dùng lệnh user bình thường
