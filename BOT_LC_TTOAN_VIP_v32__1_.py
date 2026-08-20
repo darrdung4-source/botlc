@@ -400,19 +400,20 @@ _OWNER_USERNAME = 'ddvipro'   # username owner cố định (dùng khi extra_adm
 
 def get_contact_admins() -> str:
     """
-    Trả về chuỗi liên hệ admin HTML, bao gồm owner + tất cả extra_admin.
-    - Tự động cập nhật khi /addadmin hoặc /removeadmin được gọi.
-    - Ví dụ: @ddvipro · @admin2 · @admin3
-    - Nếu extra_admin không có username → dùng tên hoặc ID.
+    Trả về chuỗi liên hệ admin HTML, bao gồm owner + tất cả extra_admin có username.
+    - Chỉ hiển thị admin là user Telegram (chat_id > 0) có username → link @mention.
+    - Admin là group (chat_id < 0) hoặc không có username → ẩn hoàn toàn (không lộ raw id).
+    - Ví dụ: @ddvipro · @admin2
     """
     parts_c = [f'<a href="https://t.me/{_OWNER_USERNAME}">@{_OWNER_USERNAME}</a>']
     for cid, info in extra_admins.items():
-        uname = info.get('username', '')
-        name  = info.get('name', str(cid))
+        # Bỏ qua group chat (id âm) và channel — chỉ hiển thị user thật
+        if isinstance(cid, int) and cid < 0:
+            continue
+        uname = (info.get('username') or '').strip().lstrip('@')
         if uname:
             parts_c.append(f'<a href="https://t.me/{uname}">@{uname}</a>')
-        else:
-            parts_c.append(f'<b>{name}</b>')
+        # Không có username → ẩn hoàn toàn (không lộ tên hay chat_id)
     return ' · '.join(parts_c)
 
 # Backward-compat alias (dùng property-like thay thế chỗ cũ)
@@ -897,6 +898,45 @@ def load_extra_admins():
     except Exception as e:
         print(f"[EXTRA_ADMINS LOAD ERR] {e}")
         extra_admins = {}
+
+async def backfill_admin_usernames():
+    """
+    Sau khi load extra_admins, fetch username từ Telegram cho những admin thiếu username.
+    Gọi 1 lần lúc startup (on_startup).
+    """
+    changed = False
+    for cid, info in list(extra_admins.items()):
+        uname = (info.get('username') or '').strip()
+        if not uname:
+            try:
+                async with aiohttp.ClientSession() as _sess:
+                    async with _sess.get(
+                        f'{TG_API}/getChat',
+                        params={'chat_id': cid},
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    ) as _r:
+                        if _r.status == 200:
+                            _d = await _r.json(content_type=None)
+                            _chat = _d.get('result', {})
+                            fetched_uname = (_chat.get('username') or '').strip()
+                            if fetched_uname:
+                                info['username'] = fetched_uname
+                                changed = True
+                                print(f"[BACKFILL] admin {cid} → @{fetched_uname}")
+                            # update name juga kalau masih raw ID
+                            cur_name = (info.get('name') or '').strip()
+                            if not cur_name or cur_name == str(cid):
+                                fn = _chat.get('first_name', '')
+                                ln = _chat.get('last_name', '')
+                                new_name = (fn + (' ' + ln if ln else '')).strip()
+                                if new_name:
+                                    info['name'] = new_name
+                                    changed = True
+            except Exception as _e:
+                print(f"[BACKFILL] admin {cid} fetch ERR: {_e}")
+    if changed:
+        save_extra_admins()
+        print("[BACKFILL] extra_admins.json updated with fetched usernames")
 
 def is_admin(chat_id: int) -> bool:
     """True nếu là ADMIN_ID (owner) hoặc đã được /addadmin"""
@@ -2661,8 +2701,28 @@ async def tg_poll_loop():
                             if target in extra_admins:
                                 await tg_send(chat_id, f'⚠️ <code>{target}</code> đã là admin rồi.')
                                 continue
-                            tname = (tg_subscribers.get(target) or key_users.get(target) or {}).get('name', str(target))
-                            tuname = (tg_subscribers.get(target) or key_users.get(target) or {}).get('username', '')
+                            local_info = tg_subscribers.get(target) or key_users.get(target) or {}
+                            tname  = local_info.get('name', str(target))
+                            tuname = local_info.get('username', '').strip()
+                            # Nếu chưa có username → thử fetch từ Telegram API
+                            if not tuname:
+                                try:
+                                    async with aiohttp.ClientSession() as _sess:
+                                        async with _sess.get(
+                                            f'{TG_API}/getChat',
+                                            params={'chat_id': target},
+                                            timeout=aiohttp.ClientTimeout(total=5),
+                                        ) as _r:
+                                            if _r.status == 200:
+                                                _d = await _r.json(content_type=None)
+                                                _chat = _d.get('result', {})
+                                                tuname = _chat.get('username', '').strip()
+                                                if not tname or tname == str(target):
+                                                    fn = _chat.get('first_name', '')
+                                                    ln = _chat.get('last_name', '')
+                                                    tname = (fn + (' ' + ln if ln else '')).strip() or str(target)
+                                except Exception as _fe:
+                                    print(f'[ADDADMIN] fetch getChat lỗi: {_fe}')
                             extra_admins[target] = {
                                 'name':     tname,
                                 'username': tuname,
