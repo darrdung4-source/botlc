@@ -334,10 +334,13 @@ class AutoBetSession:
         if self.paused:
             self.recovery_wins = 0
             return
-        # v32+: loss_x2_streak — thua đúng N ván liên tiếp → x2, rồi mỗi ván thua tiếp tục x2
+        # v32+: loss_x2_streak — thua đúng N ván liên tiếp → x2 MỘT LẦN, giữ nguyên mức đó
         if self.loss_x2_streak > 0 and self.loss_streak >= self.loss_x2_streak:
-            self._loss_x2_triggered = True
-            self.current_bet = min(self.current_bet * 2, self.ledger.balance)
+            if not self._loss_x2_triggered:
+                # lần đầu đủ chuỗi → x2 một lần duy nhất
+                self._loss_x2_triggered = True
+                self.current_bet = min(self.base_bet * 2, self.ledger.balance)
+            # đã trigger rồi → giữ nguyên mức x2, không x2 thêm
             return
         # v31: kiểm tra giảm cược (ưu tiên sau loss_x2)
         if (self.loss_streak_reduce > 0
@@ -2487,8 +2490,9 @@ async def tg_poll_loop():
                             pend['step'] = 'await_loss_x2'
                             await tg_send(chat_id,
                                 f'📈 <b>X2 cược sau chuỗi thua liên tiếp?</b>\n'
-                                f'Thua bao nhiêu ván liên tiếp thì bắt đầu x2 cược?\n'
-                                f'Mỗi ván thua tiếp theo sẽ tiếp tục x2, thắng thì reset về gốc.\n'
+                                f'Thua bao nhiêu ván liên tiếp thì x2 cược <b>một lần</b>?\n'
+                                f'Ví dụ: nhập <b>3</b> → thua 3 ván liên tiếp → cược gốc x2 (giữ nguyên mức đó, không x2 thêm)\n'
+                                f'Thắng trở lại → reset về cược gốc.\n'
                                 f'<i>(Nhập 0 nếu không dùng tính năng này)</i>')
                             continue
 
@@ -2680,7 +2684,7 @@ async def tg_poll_loop():
                                 pt_txt   = f"{pt:,}" if pt > 0 else "Không giới hạn"
                                 lr_txt   = (f"Sau {_lsr} ván thua liên tiếp → giảm xuống {_rb:,}"
                                             if _lsr > 0 else "Không giảm cược")
-                                lx2_txt  = (f"Sau {_lx2} ván thua liên tiếp → x2 mỗi ván (reset khi thắng)"
+                                lx2_txt  = (f"Sau {_lx2} ván thua liên tiếp → x2 một lần (giữ nguyên mức đó, thắng reset về gốc)"
                                             if _lx2 > 0 else "Không dùng")
                                 await tg_send(chat_id,
                                     f'✅ <b>Auto-cược đã khởi động!</b>\n'
