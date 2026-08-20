@@ -1668,60 +1668,39 @@ def run_three_logic(sess_str, md5h):
     bench = _logic_tuner.get('last_bench') or {}
     eff_wr_map = bench.get('eff_wr', {})   # { 'L1': float%, 'L3': float%, ... }
 
-    # Áp dụng bẻ chiều cho logic trong reversed set
+    # ── Bẻ độc tôn — rule áp dụng khi ensemble ──────────────────────────────────
+    # reversed_ có thể chứa 0, 1, 2, hoặc 3 logic (tuner giữ nguyên, không trim).
+    # Rule:
+    #   - 0 bẻ trong top-3          → chạy raw pred toàn bộ, không flip gì
+    #   - 2+ bẻ trong top-3         → bỏ qua tất cả bẻ, chạy raw pred toàn bộ
+    #   - Đúng 1 bẻ trong top-3     → chỉ áp bẻ khi nó là WR cao nhất trong top-3
+    #                                  (bẻ độc tôn); nếu không phải WR cao nhất → cũng bỏ
+    reversed_in_top3 = [n for n in active if n in reversed_]
+    n_bẻ = len(reversed_in_top3)
+
+    apply_flip: set = set()   # set tên logic thực sự được flip trong lần này
+
+    if n_bẻ == 1:
+        bẻ_name = reversed_in_top3[0]
+        top3_wr = {n: eff_wr_map.get(n, 0.0) for n in active}
+        max_wr  = max(top3_wr.values()) if top3_wr else 0.0
+        if top3_wr.get(bẻ_name, 0.0) >= max_wr:
+            # Bẻ độc tôn — WR cao nhất → flip
+            apply_flip = {bẻ_name}
+            print(f"[BẺ ĐỘC TÔN] {bẻ_name} WR={top3_wr[bẻ_name]:.1f}% là cao nhất → flip")
+        else:
+            print(f"[BẺ BỎ QUA] {bẻ_name} WR={top3_wr.get(bẻ_name,0):.1f}% không phải cao nhất "
+                  f"(max={max_wr:.1f}%) → chạy raw")
+    elif n_bẻ >= 2:
+        print(f"[BẺ BỎ QUA] {n_bẻ} logic bẻ trong top-3 {reversed_in_top3} → chạy raw toàn bộ")
+    # n_bẻ == 0: không làm gì, apply_flip rỗng
+
     active_preds = []
     for n in active:
         pred = all_preds[n]
-        if n in reversed_:
+        if n in apply_flip:
             pred = _flip(pred)
         active_preds.append(pred)
-
-    # ── Conditional reversed guard ─────────────────────────────────────────────
-    # Chỉ kích hoạt nếu có ít nhất 1 logic bẻ trong top-3
-    reversed_in_top3 = [n for n in active if n in reversed_]
-    if reversed_in_top3:
-        # Xác định logic bẻ có WR cao nhất trong top-3 không?
-        # So sánh WR tất cả logic trong top-3
-        top3_wr = {n: eff_wr_map.get(n, 0.0) for n in active}
-        max_wr_in_top3 = max(top3_wr.values()) if top3_wr else 0.0
-
-        # Kiểm tra từng logic bẻ: có phải WR cao nhất không?
-        # Nếu TẤT CẢ logic bẻ trong top-3 đều KHÔNG phải highest WR → áp guard
-        any_reversed_is_highest = any(
-            top3_wr.get(n, 0.0) >= max_wr_in_top3 for n in reversed_in_top3
-        )
-
-        if not any_reversed_is_highest:
-            # Guard mode: tách preds của normal vs bẻ
-            # Lấy index và pred của từng slot
-            normal_indices  = [i for i, n in enumerate(active) if n not in reversed_]
-            reversed_indices = [i for i, n in enumerate(active) if n in reversed_]
-
-            if len(normal_indices) == 2:
-                # Trường hợp chuẩn: 2 normal + 1 bẻ (hoặc 2 normal + multi bẻ)
-                n0_pred = active_preds[normal_indices[0]]
-                n1_pred = active_preds[normal_indices[1]]
-
-                if n0_pred == n1_pred:
-                    # 2 normal đồng thuận → kiểm tra bẻ vote sama atau beda
-                    rev_preds = [active_preds[i] for i in reversed_indices]
-                    all_rev_agree = all(p == n0_pred for p in rev_preds)
-
-                    if not all_rev_agree:
-                        # Bẻ vote beda dari 2 normal yang đồng thuận
-                        # → Override: 2 normal menang, bẻ diabaikan
-                        for i in reversed_indices:
-                            active_preds[i] = n0_pred   # paksa bẻ jadi sama dg normal
-                        # Log internal
-                        print(f"[GUARD] 2 normal đồng thuận [{n0_pred}] thắng bẻ — override reversed {reversed_in_top3}")
-                    # else: bẻ đồng thuận dg 2 normal → majority jalan biasa (3-0)
-
-                # else: 2 normal bất đồng → bẻ jadi penentu → jalan biasa (bẻ aktif)
-
-            elif len(normal_indices) == 1:
-                # 1 normal + 2 bẻ (edge case): normal + 1 bẻ đồng thuận thắng
-                # Mayoriti tetap dipakai biasa — tidak ada override khusus
-                pass
 
     # Build effective_preds dict để trả về (giá trị sau khi bẻ + guard)
     effective_preds = {}
