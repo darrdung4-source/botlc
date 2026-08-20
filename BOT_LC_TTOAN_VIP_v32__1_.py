@@ -3,12 +3,14 @@
 TX Ensemble Tool — Python Backend (v28 - Real WS AutoBet + Exponential Win + Profit Target)
 - Kết nối WS game: wss://wtxmd52.tele68.com/txmd5/
 - HTTP server: http://localhost:2300
-- 6 Logic Engine (L1–L6) + Session Tuner + Adaptive TT1/TT2 Grouping
+- 12 Logic Engine (L1–L12) + Session Tuner + Adaptive TT1/TT2 Grouping
   · 3 logic cũ: L1/L2/L3 (giữ nguyên công thức)
   · 3 logic mới: L4/L5/L6 (thêm v16)
+  · 3 logic mới: L7/L8/L9 (thêm v32)
+  · 3 logic mới: L10/L11/L12 (thêm v33+)
   · WARMUP: chờ 10 phiên live trước khi bắt đầu dự đoán (chỉ chạy 1 LẦN khi bật tool)
             Sau khi đổi ttoan KHÔNG warmup lại — dự đoán tiếp ngay từ ván kế tiếp.
-  · Tune chọn 3 logic mạnh nhất trong 6 → ensemble majority từ top-3
+  · Tune chọn 3 logic mạnh nhất trong 12 → ensemble majority từ top-3
   · Tune kết hợp với session tuner offset (-1/0/+1)
   · BÙ TRỪ LÔ CHÉO ĐÃ XÓA — tool giờ luôn THEO majority thuần
   · Adaptive TT1/TT2 grouping vẫn còn (phân loại case, thống kê)
@@ -45,7 +47,10 @@ TX Ensemble Tool — Python Backend (v28 - Real WS AutoBet + Exponential Win + P
 - Subscribers persistent (subs.json)
 - Key system: admin tạo key 1-365 ngày, user nhập key mới dùng được
 - Admin chatid: 8764934889 (duy nhất)
-- Admin: /newkey <days> [users], /sub, /kick <id>, /ban <id> <days>, /reloadlogic, /clearlogic
+- Admin: /newkey <days> [users], /sub, /kick <id>, /ban <id> <days>, /listkey, /removekey <key>, /reloadlogic, /clearlogic
+- v35: Dynamic contact admin (get_contact_admins) — tự động thêm/bớt khi /addadmin /removeadmin
+       /listkey hiển thị creator đúng (owner vs extra_admin)
+       /removekey gửi thông báo thu hồi đến user bị xóa key
 - User: /tool <key>, /stop, /status, /help, /autobet, /stopbet, /betstatus
 """
 import asyncio, json, os, time, hashlib, re, secrets, string, math, sys, base64, threading
@@ -391,7 +396,28 @@ HISTORY_SAVE_INTERVAL = 1    # lưu file sau mỗi phiên (persistent ngay lập
 TG_TOKEN     = '8943843485:AAF9Lhoa6DlGidZWoy8Ok_-fd5qWqau4bSs'
 TG_API       = f'https://api.telegram.org/bot{TG_TOKEN}'
 ADMIN_ID     = 8764934889          # duy nhất, cứng
-ADMIN_USERNAME = '<a href="https://t.me/ddvipro">@ddvipro</a>'  # username admin Telegram
+_OWNER_USERNAME = 'ddvipro'   # username owner cố định (dùng khi extra_admins chưa load)
+
+def get_contact_admins() -> str:
+    """
+    Trả về chuỗi liên hệ admin HTML, bao gồm owner + tất cả extra_admin.
+    - Tự động cập nhật khi /addadmin hoặc /removeadmin được gọi.
+    - Ví dụ: @ddvipro · @admin2 · @admin3
+    - Nếu extra_admin không có username → dùng tên hoặc ID.
+    """
+    parts_c = [f'<a href="https://t.me/{_OWNER_USERNAME}">@{_OWNER_USERNAME}</a>']
+    for cid, info in extra_admins.items():
+        uname = info.get('username', '')
+        name  = info.get('name', str(cid))
+        if uname:
+            parts_c.append(f'<a href="https://t.me/{uname}">@{uname}</a>')
+        else:
+            parts_c.append(f'<b>{name}</b>')
+    return ' · '.join(parts_c)
+
+# Backward-compat alias (dùng property-like thay thế chỗ cũ)
+# Các chỗ dùng {get_contact_admins()} cần đổi sang {get_contact_admins()}
+ADMIN_USERNAME = f'<a href="https://t.me/{_OWNER_USERNAME}">@{_OWNER_USERNAME}</a>'  # fallback tĩnh, chỉ dùng trước khi extra_admins load
 
 BASE_DIR     = os.environ.get('DATA_DIR', os.path.dirname(os.path.abspath(__file__)))
 SUBS_FILE    = os.path.join(BASE_DIR, 'subs.json')      # persistent subscribers
@@ -399,7 +425,12 @@ KEYS_FILE    = os.path.join(BASE_DIR, 'keys.json')      # persistent keys
 HISTORY_FILE = os.path.join(BASE_DIR, 'history.json')   # persistent history (không giới hạn)
 # key_users.json lưu riêng: { chat_id_str: { key, key_exp, name, username, joined, notify } }
 # Đây là nguồn truth duy nhất cho quyền truy cập — không bao giờ mất khi bot restart
-KEY_USERS_FILE = os.path.join(BASE_DIR, 'key_users.json')
+KEY_USERS_FILE      = os.path.join(BASE_DIR, 'key_users.json')
+EXTRA_ADMINS_FILE   = os.path.join(BASE_DIR, 'extra_admins.json')
+
+# { chat_id(int): { 'name': str, 'username': str, 'added_at': ts } }
+# Chỉ ADMIN_ID mới có thể thêm/xóa — extra_admin không thấy /removeadmin
+extra_admins: dict = {}
 
 # Bộ đếm để save_history_async không ghi đĩa mỗi phiên
 _history_unsaved_count = 0
@@ -847,9 +878,34 @@ def save_keys():
     except Exception as e:
         print(f"[KEYS SAVE ERR] {e}")
 
-def gen_key(days: int, max_users: int = 1) -> str:
+def save_extra_admins():
+    try:
+        with open(EXTRA_ADMINS_FILE, 'w') as f:
+            json.dump({str(k): v for k, v in extra_admins.items()}, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[EXTRA_ADMINS SAVE ERR] {e}")
+
+def load_extra_admins():
+    global extra_admins
+    try:
+        with open(EXTRA_ADMINS_FILE) as f:
+            raw = json.load(f)
+            extra_admins = {int(k): v for k, v in raw.items()}
+            print(f"[EXTRA_ADMINS] Loaded {len(extra_admins)} extra admin(s)")
+    except FileNotFoundError:
+        extra_admins = {}
+    except Exception as e:
+        print(f"[EXTRA_ADMINS LOAD ERR] {e}")
+        extra_admins = {}
+
+def is_admin(chat_id: int) -> bool:
+    """True nếu là ADMIN_ID (owner) hoặc đã được /addadmin"""
+    return chat_id == ADMIN_ID or chat_id in extra_admins
+
+def gen_key(days: int, max_users: int = 1, created_by: int = ADMIN_ID) -> str:
     """Tạo key ngẫu nhiên 12 ký tự dạng XXXX-XXXX-XXXX
     max_users: số người tối đa có thể dùng key này (1-100)
+    created_by: chat_id của admin đã tạo key (mặc định ADMIN_ID)
     """
     chars = string.ascii_uppercase + string.digits
     raw = ''.join(secrets.choice(chars) for _ in range(12))
@@ -862,6 +918,7 @@ def gen_key(days: int, max_users: int = 1) -> str:
         'used_by': None,        # legacy: first user (backward compat)
         'users': [],            # list of chat_id đã dùng
         'max_users': max_users, # giới hạn số người
+        'created_by': created_by,  # chat_id của admin tạo key
     }
     save_keys()
     return key
@@ -1133,6 +1190,43 @@ def _run_logic_L9(X, md5h):
     K = int(abs(inner) * (Z + 15))
     return 'XIU' if K % 2 == 0 else 'TAI'
 
+# ─── v33+: 3 Logic Mới (L10 / L11 / L12) ────────────────────────────────────
+# Y = MD5[6:8] hex  Z = MD5[30:32] hex  (giống L4–L6, L8, L9)
+#
+# L10: K = |(X + 7) min (Y + 14)| ÷ (Z ÷ 12)   chẵn→TÀI / lẻ→XỈU
+# L11: K = |(X mod 11) ÷ (Y ÷ 10)| × (Z mod 11)  chẵn→TÀI / lẻ→XỈU
+# L12: K = |(X mod 10) − (Y × 10)| ÷ (Z ÷ 10)   chẵn→XỈU / lẻ→TÀI
+
+def _run_logic_L10(X, md5h):
+    # L10: K = |(X + 7) min (Y + 14)| ÷ (Z ÷ 12)  chẵn→TÀI / lẻ→XỈU
+    # Y=MD5[6..7]  Z=MD5[30..31]
+    Y = int(md5h[6:8], 16)
+    Z = int(md5h[30:32], 16)
+    inner = min(X + 7, Y + 14)
+    z_div = _safe_div(Z, 12)
+    K = int(abs(_safe_div(inner, z_div))) if z_div != 0 else int(abs(inner))
+    return 'TAI' if K % 2 == 0 else 'XIU'
+
+def _run_logic_L11(X, md5h):
+    # L11: K = |(X mod 11) ÷ (Y ÷ 10)| × (Z mod 11)  chẵn→TÀI / lẻ→XỈU
+    # Y=MD5[6..7]  Z=MD5[30..31]
+    Y = int(md5h[6:8], 16)
+    Z = int(md5h[30:32], 16)
+    y_div = _safe_div(Y, 10)
+    inner = _safe_div(X % 11, y_div)
+    K = int(abs(inner) * (Z % 11))
+    return 'TAI' if K % 2 == 0 else 'XIU'
+
+def _run_logic_L12(X, md5h):
+    # L12: K = |(X mod 10) − (Y × 10)| ÷ (Z ÷ 10)  chẵn→XỈU / lẻ→TÀI
+    # Y=MD5[6..7]  Z=MD5[30..31]
+    Y = int(md5h[6:8], 16)
+    Z = int(md5h[30:32], 16)
+    inner = (X % 10) - (Y * 10)
+    z_div = _safe_div(Z, 10)
+    K = int(abs(_safe_div(inner, z_div))) if z_div != 0 else int(abs(inner))
+    return 'XIU' if K % 2 == 0 else 'TAI'
+
 # ─── v32: Logic Tuner — chọn top-3 trong 9 logic + BẺ CHIỀU khi reversed WR cao hơn ──
 # Sau WARMUP_COUNT phiên, mỗi LOGIC_TUNE_INTERVAL phiên:
 #   → đánh giá WR của từng logic (L1–L9) trên rolling window 30 phiên gần nhất
@@ -1154,7 +1248,8 @@ _logic_tuner = {
     'history': {
         'L1': [], 'L2': [], 'L3': [],
         'L4': [], 'L5': [], 'L6': [],
-        'L7': [], 'L8': [], 'L9': [],   # v32: 3 logic mới
+        'L7': [], 'L8': [], 'L9': [],    # v32: 3 logic mới
+        'L10': [], 'L11': [], 'L12': [], # v33+: 3 logic mới (L10/L11/L12)
     },
     # Snapshot pending: lưu pred của tất cả 9 logic cho phiên chưa có kết quả
     # { sess_id: { 'L1': 'TAI'/'XIU', ..., 'L9': ... } }
@@ -1193,11 +1288,11 @@ _ttoan_tracker = {
     'real_vans_since_swap':  0,   # chỉ đếm ván thật (reset 0 khi đổi ttoan)
 }
 
-ALL_LOGICS = ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7', 'L8', 'L9']
+ALL_LOGICS = ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7', 'L8', 'L9', 'L10', 'L11', 'L12']
 
 def _run_one_logic(name: str, X: int, Y: int, Z: int, md5h: str = '') -> str:
     """Chạy một logic theo tên, trả về 'TAI' hoặc 'XIU'.
-    L7/L8/L9 cần md5h để tự lấy Y/Z từ vị trí riêng.
+    L7/L8/L9/L10/L11/L12 cần md5h để tự lấy Y/Z từ vị trí riêng.
     """
     if name == 'L7':
         return _run_logic_L7(X, md5h)
@@ -1205,6 +1300,12 @@ def _run_one_logic(name: str, X: int, Y: int, Z: int, md5h: str = '') -> str:
         return _run_logic_L8(X, md5h)
     if name == 'L9':
         return _run_logic_L9(X, md5h)
+    if name == 'L10':
+        return _run_logic_L10(X, md5h)
+    if name == 'L11':
+        return _run_logic_L11(X, md5h)
+    if name == 'L12':
+        return _run_logic_L12(X, md5h)
     return {
         'L1': _run_logic_L1,
         'L2': _run_logic_L2,
@@ -2210,7 +2311,7 @@ async def tg_broadcast(text: str):
             key_exp = info.get('key_exp', 0)
             if key_exp and now > key_exp:
                 dead.append(chat_id)
-                await tg_send(chat_id, f'⏰ <b>Key của bạn đã hết hạn.</b>\nLiên hệ admin để gia hạn: {ADMIN_USERNAME}')
+                await tg_send(chat_id, f'⏰ <b>Key của bạn đã hết hạn.</b>\nLiên hệ admin để gia hạn: {get_contact_admins()}')
                 continue
 
         try:
@@ -2541,12 +2642,64 @@ async def tg_poll_loop():
                         continue
 
                     # ════════════════════════════════════════════════════════
-                    # ADMIN COMMANDS
+                    # ADMIN COMMANDS (ADMIN_ID + extra_admins)
                     # ════════════════════════════════════════════════════════
-                    if chat_id == ADMIN_ID:
+                    if is_admin(chat_id):
 
-                        # /newkey <days> [max_users]  — tạo key mới (chỉ admin)
-                        if cmd == '/newkey':
+                        # /addadmin <chat_id>  — chỉ ADMIN_ID (owner) mới dùng được
+                        if cmd == '/addadmin':
+                            if chat_id != ADMIN_ID:
+                                await tg_send(chat_id, '🚫 Chỉ owner mới dùng được lệnh này.')
+                                continue
+                            if len(parts) < 2 or not parts[1].lstrip('-').isdigit():
+                                await tg_send(chat_id, '⚠️ Dùng: <code>/addadmin &lt;chat_id&gt;</code>')
+                                continue
+                            target = int(parts[1])
+                            if target == ADMIN_ID:
+                                await tg_send(chat_id, '⚠️ Owner đã là admin cao nhất.')
+                                continue
+                            if target in extra_admins:
+                                await tg_send(chat_id, f'⚠️ <code>{target}</code> đã là admin rồi.')
+                                continue
+                            tname = (tg_subscribers.get(target) or key_users.get(target) or {}).get('name', str(target))
+                            tuname = (tg_subscribers.get(target) or key_users.get(target) or {}).get('username', '')
+                            extra_admins[target] = {
+                                'name':     tname,
+                                'username': tuname,
+                                'added_at': _now_ts(),
+                            }
+                            save_extra_admins()
+                            await tg_send(chat_id,
+                                f'✅ Đã cấp quyền admin cho <b>{tname}</b> (<code>{target}</code>).\n'
+                                f'Họ có thể dùng /newkey, /sub, /kick, /ban, /broadcast, /listkey, /removekey, /reloadlogic, /clearlogic.\n'
+                                f'📋 <b>{tname}</b> sẽ tự động xuất hiện trong phần <i>liên hệ admin</i> khi user hỏi mua key.\n'
+                                f'<i>Chỉ owner mới có /addadmin và /removeadmin.</i>')
+                            await tg_send(target,
+                                f'🎖 <b>Bạn đã được cấp quyền Admin.</b>\n'
+                                f'Tên bạn sẽ xuất hiện trong phần liên hệ khi user cần mua/gia hạn key.\n'
+                                f'Gõ /help để xem danh sách lệnh.')
+
+                        # /removeadmin <chat_id>  — chỉ ADMIN_ID (owner) mới dùng được
+                        elif cmd == '/removeadmin':
+                            if chat_id != ADMIN_ID:
+                                await tg_send(chat_id, '🚫 Chỉ owner mới dùng được lệnh này.')
+                                continue
+                            if len(parts) < 2 or not parts[1].lstrip('-').isdigit():
+                                await tg_send(chat_id, '⚠️ Dùng: <code>/removeadmin &lt;chat_id&gt;</code>')
+                                continue
+                            target = int(parts[1])
+                            if target not in extra_admins:
+                                await tg_send(chat_id, f'⚠️ <code>{target}</code> không phải admin.')
+                                continue
+                            removed_info = extra_admins.pop(target)
+                            save_extra_admins()
+                            rname = removed_info.get('name', str(target))
+                            await tg_send(chat_id,
+                                f'✅ Đã thu hồi quyền admin của <b>{rname}</b> (<code>{target}</code>).')
+                            await tg_send(target, '⚠️ <b>Quyền admin của bạn đã bị thu hồi.</b>')
+
+                        # /newkey <days> [max_users]  — tạo key mới (admin + extra_admin)
+                        elif cmd == '/newkey':
                             if len(parts) < 2 or not parts[1].isdigit():
                                 await tg_send(chat_id,
                                     '⚠️ Dùng:\n'
@@ -2560,14 +2713,15 @@ async def tg_poll_loop():
                             max_users = 1
                             if len(parts) >= 3 and parts[2].isdigit():
                                 max_users = min(max(int(parts[2]), 1), 100)
-                            key = gen_key(days, max_users)
+                            key = gen_key(days, max_users, created_by=chat_id)
                             exp = datetime.fromtimestamp(_now_ts() + days * 86400).strftime('%d/%m/%Y')
                             slot_txt = f'{max_users} người' if max_users > 1 else '1 người (riêng)'
+                            creator_tag = '' if chat_id == ADMIN_ID else f'\nTạo bởi: <b>{(extra_admins.get(chat_id) or {}).get("name", str(chat_id))}</b>'
                             await tg_send(chat_id,
                                 f'🔑 <b>Key mới tạo:</b>\n'
                                 f'<code>{key}</code>\n'
                                 f'Hạn: <b>{days} ngày</b> (hết {exp})\n'
-                                f'Slot: <b>{slot_txt}</b>\n'
+                                f'Slot: <b>{slot_txt}</b>{creator_tag}\n'
                                 f'Trạng thái: chưa có ai dùng')
 
                         # /sub  — danh sách subscriber
@@ -2641,6 +2795,91 @@ async def tg_poll_loop():
                             await tg_send(chat_id, f'🔨 Đã ban <b>{name}</b> (<code>{target}</code>) — {label}.')
 
 
+                        # /listkey — liệt kê tất cả key kèm người dùng
+                        elif cmd == '/listkey':
+                            if not tg_keys:
+                                await tg_send(chat_id, '🗝 Chưa có key nào.')
+                                continue
+                            now_ts = _now_ts()
+                            lines_lk = []
+                            for i, (k_str, kinfo) in enumerate(tg_keys.items(), 1):
+                                exp_ts  = kinfo.get('expires', 0)
+                                expired = now_ts > exp_ts
+                                exp_dt  = datetime.fromtimestamp(exp_ts).strftime('%d/%m/%Y') if exp_ts else '?'
+                                users_l = kinfo.get('users', [])
+                                if not users_l and kinfo.get('used_by') is not None:
+                                    users_l = [kinfo['used_by']]
+                                max_u   = kinfo.get('max_users', 1)
+                                # Thu thập tên người dùng
+                                user_tags = []
+                                for uid in users_l:
+                                    uinf = tg_subscribers.get(uid) or key_users.get(uid) or {}
+                                    uname = uinf.get('username', '')
+                                    uname_tag = f'@{uname}' if uname else uinf.get('name', str(uid))
+                                    user_tags.append(f'{uname_tag} (<code>{uid}</code>)')
+                                users_str = ', '.join(user_tags) if user_tags else '—'
+                                status_tag = '❌ Hết hạn' if expired else '✅ Còn hạn'
+                                creator_id = kinfo.get('created_by', ADMIN_ID)
+                                if creator_id == ADMIN_ID:
+                                    creator_tag = f'<a href="https://t.me/{_OWNER_USERNAME}">@{_OWNER_USERNAME}</a>'
+                                else:
+                                    c_info = extra_admins.get(creator_id) or {}
+                                    creator_tag = (f'@{c_info["username"]}' if c_info.get('username')
+                                                   else (c_info.get('name', str(creator_id)) if c_info else f'<code>{creator_id}</code>'))
+                                lines_lk.append(
+                                    f'{i}. <code>{k_str}</code> — {status_tag}\n'
+                                    f'   Hạn: <b>{kinfo.get("days","?")} ngày</b> (đến {exp_dt}) | '
+                                    f'Slot: {len(users_l)}/{max_u}\n'
+                                    f'   Người dùng: {users_str}\n'
+                                    f'   Tạo bởi: {creator_tag}'
+                                )
+                            # Chia nhỏ nếu quá nhiều key (tránh message quá dài)
+                            chunk_size = 10
+                            chunks_lk  = [lines_lk[i:i+chunk_size] for i in range(0, len(lines_lk), chunk_size)]
+                            await tg_send(chat_id, f'🗝 <b>Danh sách keys ({len(tg_keys)}):</b>')
+                            for chunk_lk in chunks_lk:
+                                await tg_send(chat_id, '\n\n'.join(chunk_lk))
+
+                        # /removekey <KEY> — xóa key
+                        elif cmd == '/removekey':
+                            if len(parts) < 2:
+                                await tg_send(chat_id, '⚠️ Dùng: <code>/removekey XXXX-XXXX-XXXX</code>')
+                                continue
+                            rk_str = parts[1].upper().strip()
+                            if rk_str not in tg_keys:
+                                await tg_send(chat_id, f'❌ Key <code>{rk_str}</code> không tồn tại.')
+                                continue
+                            rk_info   = tg_keys.pop(rk_str)
+                            save_keys()
+                            # Xóa key_users entry nếu key này là key của họ
+                            revoked = []
+                            for uid in list(rk_info.get('users', [])):
+                                ku = key_users.get(uid)
+                                if ku and ku.get('key', '').upper() == rk_str:
+                                    ku['key']     = ''
+                                    ku['key_exp'] = 0
+                                    ku['notify']  = False
+                                    revoked.append(uid)
+                                    if uid in tg_subscribers:
+                                        del tg_subscribers[uid]
+                            if revoked:
+                                save_key_users()
+                                save_subs()
+                                # Thông báo cho từng user bị thu hồi key
+                                for uid in revoked:
+                                    try:
+                                        await tg_send(uid,
+                                            f'⚠️ <b>Key của bạn đã bị thu hồi bởi admin.</b>\n'
+                                            f'Liên hệ admin để mua key mới: {get_contact_admins()}')
+                                    except Exception:
+                                        pass
+                            rk_days = rk_info.get('days', '?')
+                            await tg_send(chat_id,
+                                f'🗑 <b>Đã xóa key:</b> <code>{rk_str}</code>\n'
+                                f'Hạn gốc: <b>{rk_days} ngày</b>\n'
+                                f'Người dùng bị thu hồi: <b>{len(revoked)}</b> người'
+                                + (f'\n✅ Đã gửi thông báo thu hồi đến {len(revoked)} user.' if revoked else ''))
+
                         # /broadcast <message> — gửi thông báo đến toàn bộ user đã /start
                         elif cmd in ('/broadcast', '/announce', '/tb'):
                             if len(parts) < 2:
@@ -2687,6 +2926,12 @@ async def tg_poll_loop():
                                 '/sub — Xem danh sách subscriber\n'
                                 '/kick &lt;chat_id&gt; — Xoá user khỏi danh sách\n'
                                 '/ban &lt;chat_id&gt; &lt;ngày&gt; — Ban user (0=vĩnh viễn)\n\n'
+                                '🗝 <b>Quản lý Key</b>\n'
+                                '/listkey — Liệt kê tất cả key kèm người dùng\n'
+                                '/removekey &lt;KEY&gt; — Xóa key (thu hồi quyền truy cập)\n\n'
+                                + ('🎖 <b>Quản lý Admin (chỉ owner)</b>\n'
+                                '/addadmin &lt;chat_id&gt; — Cấp quyền admin\n'
+                                '/removeadmin &lt;chat_id&gt; — Thu hồi quyền admin\n\n' if chat_id == ADMIN_ID else '') +
                                 '📢 <b>Thông báo</b>\n'
                                 '/broadcast &lt;nội dung&gt; — Gửi TB đến toàn bộ user\n\n'
                                 '📊 <b>Thống kê</b>\n'
@@ -2881,7 +3126,7 @@ async def _handle_user_cmd(chat_id: int, uinfo: dict, cmd: str, parts: list):
             '👋 <b>Chào mừng đến TX Tool!</b>\n\n'
             'Để bắt đầu, bạn cần nhập key:\n'
             '<code>/key XXXX-XXXX-XXXX</code>\n\n'
-            f'💬 Liên hệ admin để mua key: {ADMIN_USERNAME}')
+            f'💬 Liên hệ admin để mua key: {get_contact_admins()}')
         return
 
     # /help — user thường thấy lệnh cơ bản
@@ -2901,13 +3146,13 @@ async def _handle_user_cmd(chat_id: int, uinfo: dict, cmd: str, parts: list):
                 '/key &lt;KEY&gt; — Nhập / bật lại key\n'
                 '/history — Xem kết quả đúng/sai 30 phiên gần nhất\n'
                 '/help — Danh sách lệnh này\n\n'
-                f'💬 Liên hệ admin để gia hạn key: {ADMIN_USERNAME}')
+                f'💬 Liên hệ admin để gia hạn key: {get_contact_admins()}')
         else:
             await tg_send(chat_id,
                 '📖 <b>Danh sách lệnh</b>\n\n'
                 '/key &lt;KEY&gt; — Nhập key để kích hoạt tool\n'
                 '/history — Xem kết quả đúng/sai 30 phiên gần nhất\n\n'
-                f'💬 Liên hệ admin để mua key: {ADMIN_USERNAME}')
+                f'💬 Liên hệ admin để mua key: {get_contact_admins()}')
         return
 
     # ── Gate: lệnh khác bắt buộc phải có key hợp lệ ───────────────────────────
@@ -2919,13 +3164,13 @@ async def _handle_user_cmd(chat_id: int, uinfo: dict, cmd: str, parts: list):
                 f'🔒 <b>Bạn chưa có key.</b>\n'
                 f'Nhập key để dùng tool:\n'
                 f'<code>/key XXXX-XXXX-XXXX</code>\n\n'
-                f'Liên hệ admin để mua key: {ADMIN_USERNAME}')
+                f'Liên hệ admin để mua key: {get_contact_admins()}')
             return
         if now > ku.get('key_exp', 0):
             exp_dt = datetime.fromtimestamp(ku['key_exp']).strftime('%d/%m/%Y %H:%M')
             await tg_send(chat_id,
                 f'⏰ <b>Key của bạn đã hết hạn</b> từ {exp_dt}.\n'
-                f'Liên hệ admin để gia hạn: {ADMIN_USERNAME}')
+                f'Liên hệ admin để gia hạn: {get_contact_admins()}')
             return
 
     # ── /key <KEY> — chỉ đăng ký / xác thực key, KHÔNG tự bật nhận dự đoán ───
@@ -2934,7 +3179,7 @@ async def _handle_user_cmd(chat_id: int, uinfo: dict, cmd: str, parts: list):
             await tg_send(chat_id,
                 f'🔑 Nhập key theo cú pháp:\n'
                 f'<code>/key XXXX-XXXX-XXXX</code>\n\n'
-                f'Liên hệ admin để mua key: {ADMIN_USERNAME}')
+                f'Liên hệ admin để mua key: {get_contact_admins()}')
             return
 
         key = parts[1].upper().strip()
@@ -2945,14 +3190,14 @@ async def _handle_user_cmd(chat_id: int, uinfo: dict, cmd: str, parts: list):
         if not k:
             await tg_send(chat_id,
                 f'❌ <b>Key không hợp lệ.</b>\n'
-                f'Kiểm tra lại key hoặc liên hệ admin: {ADMIN_USERNAME}')
+                f'Kiểm tra lại key hoặc liên hệ admin: {get_contact_admins()}')
             return
 
         # Key hết hạn
         if now > k['expires']:
             await tg_send(chat_id,
                 f'❌ <b>Key đã hết hạn.</b>\n'
-                f'Liên hệ admin để gia hạn: {ADMIN_USERNAME}')
+                f'Liên hệ admin để gia hạn: {get_contact_admins()}')
             return
 
         # Kiểm tra slot
@@ -2965,7 +3210,7 @@ async def _handle_user_cmd(chat_id: int, uinfo: dict, cmd: str, parts: list):
         if chat_id not in users_list and len(users_list) >= max_users:
             await tg_send(chat_id,
                 f'❌ <b>Key đã đầy.</b>\n'
-                f'Liên hệ admin để mua key khác: {ADMIN_USERNAME}')
+                f'Liên hệ admin để mua key khác: {get_contact_admins()}')
             return
 
         # Ghi user vào key['users']
@@ -3988,16 +4233,26 @@ async def handle_admin_keys(request):
                 'username': sub.get('username', ''),
             })
 
+        # Resolve created_by → display name
+        creator_id   = v.get('created_by', ADMIN_ID)
+        if creator_id == ADMIN_ID:
+            creator_name = None   # web JS shows "Owner" for None
+        else:
+            creator_info = extra_admins.get(creator_id) or {}
+            creator_name = creator_info.get('name', str(creator_id))
+
         data.append({
-            'key':          k,
-            'days':         v['days'],
-            'created':      datetime.fromtimestamp(v['created']).strftime('%d/%m/%Y %H:%M'),
-            'expires':      datetime.fromtimestamp(v['expires']).strftime('%d/%m/%Y %H:%M'),
-            'used_by':      v.get('used_by'),  # backward compat
-            'users':        users_detail,
-            'used_count':   len(users_list),
-            'max_users':    max_users,
-            'active':       now <= v['expires'],
+            'key':            k,
+            'days':           v['days'],
+            'created':        datetime.fromtimestamp(v['created']).strftime('%d/%m/%Y %H:%M'),
+            'expires':        datetime.fromtimestamp(v['expires']).strftime('%d/%m/%Y %H:%M'),
+            'used_by':        v.get('used_by'),  # backward compat
+            'users':          users_detail,
+            'used_count':     len(users_list),
+            'max_users':      max_users,
+            'active':         now <= v['expires'],
+            'created_by':     creator_id,
+            'created_by_name': creator_name,   # None = owner, str = extra admin name
         })
     return web.json_response({'ok': True, 'keys': data, 'total': len(data)})
 
@@ -4006,7 +4261,7 @@ async def handle_admin_genkey(request):
     body      = await request.json()
     days      = min(max(int(body.get('days', 7)), 1), 365)
     max_users = min(max(int(body.get('max_users', 1)), 1), 100)
-    key       = gen_key(days, max_users)
+    key       = gen_key(days, max_users, created_by=ADMIN_ID)
     exp       = datetime.fromtimestamp(_now_ts() + days * 86400).strftime('%d/%m/%Y')
     return web.json_response({'ok': True, 'key': key, 'days': days,
                               'max_users': max_users, 'expires': exp})
@@ -4065,7 +4320,7 @@ async def handle_admin_delete_key(request):
         if ku:
             kicked.append(ku.get('name', str(uid)))
         asyncio.create_task(
-            tg_send(uid, f'❌ <b>Key không hợp lệ.</b>\nKey của bạn đã hết hiệu lực. Liên hệ admin để lấy key mới: {ADMIN_USERNAME}')
+            tg_send(uid, f'❌ <b>Key không hợp lệ.</b>\nKey của bạn đã hết hiệu lực. Liên hệ admin để lấy key mới: {get_contact_admins()}')
         )
 
     if users_list:
@@ -5583,6 +5838,10 @@ async function loadKeys() {
       ).join('');
     }
 
+    const creatorTxt = k.created_by_name
+      ? `<span style="font-size:10px;color:#a0aec0">${k.created_by_name}</span>`
+      : '<span style="font-size:10px;color:#4a5568">Owner</span>';
+
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td><code style="font-size:11px;color:#00ffcc;letter-spacing:1px">${k.key}</code></td>
@@ -5590,6 +5849,7 @@ async function loadKeys() {
       <td style="font-size:10px;color:#a0aec0">${k.expires}</td>
       <td style="color:${slotColor};font-weight:700">${slotTxt}</td>
       <td>${usersTxt}</td>
+      <td>${creatorTxt}</td>
       <td style="color:${k.active?'#19e3a0':'#718096'}">${k.active?'Còn hạn':'Hết hạn'}</td>
       <td><button onclick="deleteKey('${k.key}')" style="background:#7f1d1d;color:#fc8181;border:1px solid #fc8181;border-radius:4px;padding:3px 8px;cursor:pointer;font-size:10px;font-weight:700">🗑 Xóa</button></td>`;
     tbody.appendChild(tr);
@@ -5820,6 +6080,7 @@ async function doBan() {
         <th style="padding:6px 8px;text-align:left">Hết hạn</th>
         <th style="padding:6px 8px;text-align:left">Slot</th>
         <th style="padding:6px 8px;text-align:left">Người dùng (Chat ID · Tên)</th>
+        <th style="padding:6px 8px;text-align:left">Người tạo</th>
         <th style="padding:6px 8px;text-align:left">Status</th>
         <th style="padding:6px 8px;text-align:left">Action</th>
       </tr></thead>
@@ -5855,6 +6116,7 @@ async def on_startup(app):
     load_history()    # load persistent history từ file trước
     load_subs_keys()
     load_started_users()
+    load_extra_admins()
     app_state['tg_task'] = asyncio.create_task(tg_poll_loop())
     print(f"[TG] Bot started — token: {TG_TOKEN[:20]}...")
 
@@ -5902,7 +6164,7 @@ if __name__ == '__main__':
     print("  [NO CROSS-COMP] Luôn THEO majority — không bù trừ lô chéo")
     print(f"  http://localhost:{PORT}")
     print(f"  History file : history.json (lưu không giới hạn)")
-    print(f"  Logic: L1–L6 | Top-3 auto-tune theo WR | Warmup {WARMUP_COUNT} phiên (1 lần)")
+    print(f"  Logic: L1–L12 | Top-3 auto-tune theo WR | Warmup {WARMUP_COUNT} phiên (1 lần)")
     print(f"  TTOAN: giữ WR≥60% | đổi WR<40% + trim từ ván sai gần nhất")
     print(f"  Session Tuner offset auto | Majority follow")
     print(f"  Telegram Bot : /tool (dự đoán) | /autobet (auto-cược) | /stop /stopbet")
