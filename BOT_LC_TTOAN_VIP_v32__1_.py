@@ -413,6 +413,7 @@ TTOAN_WR_SWAP_THRESH  = 0.40   # WR 10 ván < 40% → đổi ttoan ngay lập t�
 TTOAN_CHECK_WINDOW    = 10     # số ván gần nhất để tính WR kiểm tra
 TTOAN_CONSEC_LOSS_BAIL = 3     # v35: sai liên tiếp 3 ván thật → đổi ttoan khẩn (không cần đủ window)
 HISTORY_SAVE_INTERVAL = 1    # lưu file sau mỗi phiên (persistent ngay lập tức)
+BE_DOMINANT_MIN_GAP   = 0.0  # gap tối thiểu WR bẻ phải hơn logic thuần (0.0=chỉ cần >; 0.10=>=10%; 0.15=>=15%)
 
 # ─── Telegram Config ──────────────────────────────────────────────────────────
 TG_TOKEN     = '8943843485:AAF9Lhoa6DlGidZWoy8Ok_-fd5qWqau4bSs'
@@ -1847,13 +1848,14 @@ def run_three_logic(sess_str, md5h):
         bẻ_name = reversed_in_top3[0]
         top3_wr = {n: eff_wr_map.get(n, 0.0) for n in active}
         max_wr  = max(top3_wr.values()) if top3_wr else 0.0
-        if top3_wr.get(bẻ_name, 0.0) >= max_wr:
-            # Bẻ độc tôn — WR cao nhất → flip
+        if top3_wr.get(bẻ_name, 0.0) > max_wr:
+            # Bẻ độc tôn — WR STRICTLY cao hơn tất cả → flip
             apply_flip = {bẻ_name}
-            print(f"[BẺ ĐỘC TÔN] {bẻ_name} WR={top3_wr[bẻ_name]:.1f}% là cao nhất → flip")
+            print(f"[BẺ ĐỘC TÔN] {bẻ_name} WR={top3_wr[bẻ_name]:.1f}% cao hơn hết → flip")
         else:
-            print(f"[BẺ BỎ QUA] {bẻ_name} WR={top3_wr.get(bẻ_name,0):.1f}% không phải cao nhất "
-                  f"(max={max_wr:.1f}%) → chạy raw")
+            # Bằng hoặc thấp hơn → không flip, theo raw (majority)
+            print(f"[BẺ BỎ QUA] {bẻ_name} WR={top3_wr.get(bẻ_name,0):.1f}% bằng/thấp hơn "
+                  f"(max={max_wr:.1f}%) → theo đa số raw")
     elif n_bẻ >= 2:
         print(f"[BẺ BỎ QUA] {n_bẻ} logic bẻ trong top-3 {reversed_in_top3} → chạy raw toàn bộ")
     # n_bẻ == 0: không làm gì, apply_flip rỗng
@@ -2227,49 +2229,14 @@ def get_ensemble_cross_comp(logic_result):
 
         return ensemble, group, False, 1.0
 
-    # ── CASE 3: Top-3 có 2 logic bẻ ─────────────────────────────────────────
-    # Phân biệt 2 sub-case:
-    #   3a. 2 logic bẻ ĐỒNG THUẬN nhau (cùng pred TAI hoặc cùng XIU)
-    #       → THEO kết quả của 2 logic bẻ (không theo thiểu số).
-    #   3b. 2 logic bẻ KHÔNG ĐỒNG THUẬN (1 bẻ đồng thuận vs logic thường,
-    #       còn logic bẻ kia bất đồng) → theo THIỂU SỐ tức theo BẺ2.
+    # ── CASE 3: Top-3 có 2 logic bẻ → theo đa số bình thường ───────────────
     if n_be == 2:
-        tai_c = active_preds.count('TAI')
-        xiu_c = active_preds.count('XIU')
+        tai_c    = active_preds.count('TAI')
+        xiu_c    = active_preds.count('XIU')
         vote_str = f"{max(tai_c,xiu_c)}-{min(tai_c,xiu_c)}"
-
-        # Tìm pred của 2 logic bẻ và 1 logic thường
-        be_indices    = [i for i, n in enumerate(active) if n in reversed_set]
-        thuan_indices = [i for i, n in enumerate(active) if n not in reversed_set]
-
-        be_preds    = [active_preds[i] for i in be_indices]    # pred 2 logic bẻ (đã flip)
-        thuan_preds = [active_preds[i] for i in thuan_indices] # pred logic thường
-
-        # Sub-case 3a: 2 logic bẻ đồng thuận nhau
-        if be_preds[0] == be_preds[1]:
-            consensus_be = be_preds[0]
-            if tai_c == 3 or xiu_c == 3:
-                # 3-0: cả 3 cùng đoán (2 bẻ + 1 thường cùng chiều) → bẻ ngược như cũ
-                flip_pred = _flip(majority)
-                print(f"[ENSEMBLE] {group} → 🔁 2-BẺ ĐỒNG THUẬN 3-0: vote=3-0 majority={majority} "
-                      f"→ BẺ NGƯỢC = {flip_pred}")
-                return flip_pred, group, False, 1.0
-            else:
-                # 2-1: 2 bẻ đồng thuận, logic thường khác chiều → theo 2 bẻ
-                print(f"[ENSEMBLE] {group} → ✅ 2-BẺ ĐỒNG THUẬN 2-1: cả 2 bẻ đều dự đoán "
-                      f"{consensus_be} (vote={vote_str} majority={majority}) → THEO 2-BẺ = {consensus_be}")
-                return consensus_be, group, False, 1.0
-
-        # Sub-case 3b: 2 logic bẻ không đồng thuận
-        # BẺ1 đồng pred với logic thường → 2 người cùng chiều (majority)
-        # BẺ2 đứng một mình → chính là thiểu số
-        # → theo thiểu số (pred khác với 2 logic đồng thuận kia)
-        minority_pred = _minority_vote(active_preds, majority)
-        thuan_pred = thuan_preds[0] if thuan_preds else None
-        print(f"[ENSEMBLE] {group} → ⚔️  2-BẺ KHÔNG ĐỒNG THUẬN: "
-              f"thường={thuan_pred} bẻ1={be_preds[0]} bẻ2={be_preds[1]} "
-              f"(vote={vote_str} majority={majority}) → THIỂU SỐ = {minority_pred}")
-        return minority_pred, group, False, 1.0
+        print(f"[ENSEMBLE] {group} → 🔁 2-BẺ → THEO ĐA SỐ (bth) "
+              f"vote={vote_str} → {majority}")
+        return majority, group, False, 1.0
 
     # ── CASE 4 & 5: Top-3 có đúng 1 logic bẻ ────────────────────────────────
     # n_be == 1
@@ -2289,11 +2256,9 @@ def get_ensemble_cross_comp(logic_result):
             thuan_logics = [n for n in active if n not in reversed_set]
             thuan_wrs    = [eff_wr.get(n) for n in thuan_logics if eff_wr.get(n) is not None]
 
-            # CASE 4 — BẺ ĐỘC TÔN MẠNH: WR bẻ cao hơn TẤT CẢ logic thuận > 15%
-            # Điều kiện: be_wr phải hơn MỖI logic thuần ít nhất 15 điểm % (0.15)
-            # Nếu chỉ hơn 1 trong 2 logic thuần, hoặc không đủ 15% → YẾU
-            BE_DOMINANT_MIN_GAP = 0.15   # 15% gap so với mỗi logic thuần
-            if thuan_wrs and all(be_wr - tw >= BE_DOMINANT_MIN_GAP for tw in thuan_wrs):
+            # CASE 4 — BẺ ĐỘC TÔN: WR bẻ cao hơn TẤT CẢ logic thuận tối thiểu BE_DOMINANT_MIN_GAP
+            # BE_DOMINANT_MIN_GAP=0.0 → strictly >; 0.10 → phải hơn >=10% (/tinhchinh gap <số>)
+            if thuan_wrs and all(be_wr - tw > BE_DOMINANT_MIN_GAP for tw in thuan_wrs):
                 try:
                     be_idx        = active.index(be_name)
                     dominant_pred = active_preds[be_idx]   # đã flip sẵn
@@ -2301,27 +2266,27 @@ def get_ensemble_cross_comp(logic_result):
                 except (ValueError, IndexError):
                     be_dominant = False
 
-    # CASE 4: BẺ ĐỘC TÔN MẠNH → theo pred của logic bẻ (chỉ khi hơn 2 logic thuần ≥15%)
+    # CASE 4: BẺ ĐỘC TÔN — WR bẻ > cả 2 logic thuần → THEO bẻ tuyệt đối
     if be_dominant and dominant_pred:
         gaps = [round((be_wr - tw) * 100, 1) for tw in thuan_wrs]
-        print(f"[ENSEMBLE] {group} → 🔱 BẺ ĐỘC TÔN MẠNH [{be_name} eff_wr={be_wr:.1%}] "
-              f"gap={gaps}% > thuận={[round(w,3) for w in thuan_wrs]} → THEO BẺ = {dominant_pred} "
+        print(f"[ENSEMBLE] {group} → 🔱 BẺ ĐỘC TÔN [{be_name} eff_wr={be_wr:.1%}] "
+              f"gap={gaps}% > thuận={[round(w*100,1) for w in thuan_wrs]}% → THEO BẺ = {dominant_pred} "
               f"(bỏ majority={majority})")
         return dominant_pred, group, False, 1.0
 
-    # CASE 5 — BẺ ĐỘC TÔN YẾU: WR bẻ chưa hơn đủ 15% so với tất cả logic thuần → THIỂU SỐ
-    minority_pred = _minority_vote(active_preds, majority)
+    # CASE 5 — BẺ ĐỘC TÔN YẾU: WR bẻ bằng hoặc thấp hơn ≥1 logic thuần → THEO ĐA SỐ
+    # Không dùng thiểu số — tránh tình huống cả 3 vote XIU mà bẻ lại ra TAI
     tai_c = active_preds.count('TAI')
     xiu_c = active_preds.count('XIU')
     vote_str = f"{max(tai_c,xiu_c)}-{min(tai_c,xiu_c)}"
     if be_wr is not None and thuan_wrs:
         gaps = [round((be_wr - tw) * 100, 1) for tw in thuan_wrs]
-        wr_tag = f"[{be_name} eff_wr={be_wr:.1%} gap={gaps}% <15%]"
+        wr_tag = f"[{be_name} eff_wr={be_wr:.1%} gap={gaps}% — không đủ]"
     else:
-        wr_tag = f"[{be_name}]"
+        wr_tag = f"[{be_name} — không đủ dữ liệu]"
     print(f"[ENSEMBLE] {group} → 🔻 BẺ ĐỘC TÔN YẾU {wr_tag} → "
-          f"vote={vote_str} majority={majority} → THIỂU SỐ = {minority_pred}")
-    return minority_pred, group, False, 1.0
+          f"vote={vote_str} majority={majority} → THEO ĐA SỐ = {majority}")
+    return majority, group, False, 1.0
 
 
 def update_cross_comp(sess_id, case_type, actual_result, pred_made):
@@ -3069,6 +3034,9 @@ async def tg_poll_loop():
                         # (giống khi sai 3 lần liên tiếp, KHÔNG clear rolling history)
                         elif cmd == '/reloadlogic':
                             # ── Reset TTOAN tracker + đổi ttoan ngay ──────────────────
+                            old_top3_rl = _logic_tuner.get('active_logics', [])[:]
+                            old_rev_rl  = list(_logic_tuner.get('reversed_logics', set()))
+
                             _ttoan_tracker['vans_since_swap']      = 0
                             _ttoan_tracker['history_since_swap']   = []
                             _ttoan_tracker['pre_trim_count']       = 0
@@ -3077,16 +3045,23 @@ async def tg_poll_loop():
                             _ttoan_tracker['swap_count']          += 1
                             _ttoan_tracker['last_swap_reason']     = 'manual_reload'
 
+                            # ── Force re-tune logic: chọn lại top-3 từ WR hiện tại ────
+                            # Đảm bảo logic WR cao hơn trong bảng sẽ được chọn ngay
+                            _run_logic_tune()
+
                             swap_no  = _ttoan_tracker['swap_count']
                             cur_top3 = _logic_tuner.get('active_logics', [])
                             cur_rev  = list(_logic_tuner.get('reversed_logics', set()))
                             top3_str = ' · '.join(f'<code>{l}</code>' for l in cur_top3)
                             rev_str  = (', '.join(f'<code>{l}</code>' for l in cur_rev)
                                         if cur_rev else '—')
+                            old_top3_str = ' · '.join(f'<code>{l}</code>' for l in old_top3_rl)
+
+                            changed_tag = '✅ Đã đổi top-3' if cur_top3 != old_top3_rl else '↩️ Top-3 giữ nguyên (đã là tốt nhất)'
 
                             print(f"[RELOADLOGIC] Admin ép đổi ttoan #{swap_no} "
                                   f"@ live#{app_state['live_count']} "
-                                  f"(rolling history GIỮ NGUYÊN)")
+                                  f"| logic: {old_top3_rl} → {cur_top3}")
 
                             await tg_send(chat_id,
                                 f'🔀 <b>RELOAD TTOAN — Hoàn tất</b>\n'
@@ -3095,9 +3070,11 @@ async def tg_poll_loop():
                                 f'  • TTOAN tracker reset (lần đổi #{swap_no})\n'
                                 f'  • Chuỗi sai liên tiếp xóa sạch\n'
                                 f'  • vans_since_swap, history_since_swap reset về 0\n\n'
-                                f'🧠 <b>Logic hiện tại (GIỮ NGUYÊN):</b>\n'
-                                f'  Top-3: {top3_str}\n'
+                                f'🔁 <b>Re-tune Logic (từ WR hiện tại):</b>\n'
+                                f'  Cũ: {old_top3_str}\n'
+                                f'  Mới: {top3_str}\n'
                                 f'  BẺ chiều: {rev_str}\n'
+                                f'  {changed_tag}\n'
                                 f'━━━━━━━━━━━━━━\n'
                                 f'⚡ Ttoan mới có hiệu lực từ phiên kế tiếp.\n'
                                 f'💡 Dùng /clearlogic để clear rolling history 9 logic.\n'
@@ -3200,17 +3177,57 @@ async def tg_poll_loop():
 
                         # ── /tinhchinh — Tinh chỉnh số ván thua liên tiếp đổi ttoan ──
                         elif cmd == '/tinhchinh':
-                            global TTOAN_CONSEC_LOSS_BAIL
+                            global TTOAN_CONSEC_LOSS_BAIL, BE_DOMINANT_MIN_GAP
+                            # ── Không có arg → hiện menu ─────────────────────────────
                             if len(parts) < 2:
+                                gap_pct = round(BE_DOMINANT_MIN_GAP * 100, 1)
                                 await tg_send(chat_id,
-                                    f'⚙️ <b>TINH CHỈNH — Chuỗi thua đổi ttoan</b>\n'
+                                    f'⚙️ <b>TINH CHỈNH — Các thông số</b>\n'
                                     f'━━━━━━━━━━━━━━\n'
-                                    f'Hiện tại: <b>{TTOAN_CONSEC_LOSS_BAIL}</b> ván thua liên tiếp → đổi ttoan khẩn\n\n'
-                                    f'Dùng: <code>/tinhchinh &lt;số ván&gt;</code>\n'
-                                    f'Ví dụ: <code>/tinhchinh 5</code> → sau 5 ván thua liên tiếp mới đổi\n'
-                                    f'<i>(Tối thiểu 1, mặc định 3)</i>\n'
+                                    f'1️⃣ <b>Chuỗi thua đổi ttoan:</b> <code>{TTOAN_CONSEC_LOSS_BAIL}</code> ván\n'
+                                    f'   Dùng: <code>/tinhchinh &lt;số&gt;</code>\n'
+                                    f'   VD: <code>/tinhchinh 5</code>\n\n'
+                                    f'2️⃣ <b>Gap bẻ độc tôn:</b> <code>{gap_pct}%</code>\n'
+                                    f'   WR bẻ phải hơn logic thuần ít nhất gap này mới kích hoạt bẻ\n'
+                                    f'   0% = chỉ cần strictly cao hơn | 10% = phải hơn ≥10%\n'
+                                    f'   Dùng: <code>/tinhchinh gap &lt;số&gt;</code>\n'
+                                    f'   VD: <code>/tinhchinh gap 10</code> hoặc <code>/tinhchinh gap 0</code>\n'
                                     f'<i>(Lệnh này chỉ admin thấy)</i>')
                                 continue
+
+                            # ── /tinhchinh gap <số> → đổi BE_DOMINANT_MIN_GAP ─────────
+                            if parts[1].lower() == 'gap':
+                                if len(parts) < 3:
+                                    gap_pct = round(BE_DOMINANT_MIN_GAP * 100, 1)
+                                    await tg_send(chat_id,
+                                        f'⚙️ Gap bẻ độc tôn hiện tại: <b>{gap_pct}%</b>\n'
+                                        f'Dùng: <code>/tinhchinh gap &lt;số%&gt;</code>\n'
+                                        f'VD: <code>/tinhchinh gap 10</code> → gap 10%\n'
+                                        f'    <code>/tinhchinh gap 0</code>  → chỉ cần strictly cao hơn')
+                                    continue
+                                try:
+                                    new_gap_pct = float(parts[2])
+                                    if new_gap_pct < 0 or new_gap_pct > 50:
+                                        await tg_send(chat_id, '⚠️ Gap phải trong khoảng 0–50 (%).')
+                                        continue
+                                    old_gap_pct = round(BE_DOMINANT_MIN_GAP * 100, 1)
+                                    BE_DOMINANT_MIN_GAP = new_gap_pct / 100.0
+                                    print(f"[TINHCHINH] Admin đổi BE_DOMINANT_MIN_GAP: {old_gap_pct}% → {new_gap_pct}% "
+                                          f"@ live#{app_state['live_count']}")
+                                    await tg_send(chat_id,
+                                        f'✅ <b>TINH CHỈNH GAP — Hoàn tất</b>\n'
+                                        f'━━━━━━━━━━━━━━\n'
+                                        f'Gap bẻ độc tôn:\n'
+                                        f'  Cũ: <b>{old_gap_pct}%</b>\n'
+                                        f'  Mới: <b>{new_gap_pct}%</b>\n\n'
+                                        f'⚡ Hiệu lực từ phiên kế tiếp.\n'
+                                        f'Bẻ độc tôn chỉ kích hoạt khi WR bẻ hơn logic thuần ≥<b>{new_gap_pct}%</b>\n'
+                                        f'<i>(Lệnh này chỉ admin thấy)</i>')
+                                except ValueError:
+                                    await tg_send(chat_id, '⚠️ Nhập số. VD: /tinhchinh gap 10')
+                                continue
+
+                            # ── /tinhchinh <số> → đổi TTOAN_CONSEC_LOSS_BAIL ──────────
                             try:
                                 new_val = int(parts[1])
                                 if new_val < 1:
@@ -3218,7 +3235,6 @@ async def tg_poll_loop():
                                     continue
                                 old_val = TTOAN_CONSEC_LOSS_BAIL
                                 TTOAN_CONSEC_LOSS_BAIL = new_val
-                                # Reset chuỗi sai hiện tại để tránh trigger ngay lập tức
                                 _ttoan_tracker['real_vans_since_swap'] = 0
                                 _ttoan_tracker['history_since_swap']   = []
                                 _ttoan_tracker['vans_since_swap']      = 0
