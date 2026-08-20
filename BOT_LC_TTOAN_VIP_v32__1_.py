@@ -253,6 +253,7 @@ class AutoBetSession:
     v31: + win_streak_x2  (thắng bao nhiêu ván liên tiếp mới x2 — thay vì x2 ngay lần đầu)
          + loss_streak_reduce / reduced_bet (thua N ván → giảm cược xuống mức reduced_bet)
          + loss_streak_stop / win_streak_cont vẫn còn (pause/resume như v29)
+    v32+: + loss_x2_streak (thua N ván liên tiếp → x2 cược, 0=không dùng tính năng này)
     """
     def __init__(
         self,
@@ -271,6 +272,7 @@ class AutoBetSession:
         profit_target: int = 0,    # dừng khi lãi >= target (0=không giới hạn)
         loss_streak_reduce: int = 0,  # v31: thua N ván liên tiếp → giảm cược (0=không)
         reduced_bet: int = 0,         # v31: mức cược giảm xuống khi đủ loss_streak_reduce
+        loss_x2_streak: int = 0,      # v32+: thua N ván liên tiếp → x2 cược (0=không)
     ):
         self.chat_id            = chat_id
         self.jwt                = jwt
@@ -288,6 +290,7 @@ class AutoBetSession:
         self.profit_target      = profit_target
         self.loss_streak_reduce = loss_streak_reduce  # v31
         self.reduced_bet        = reduced_bet if reduced_bet > 0 else base_bet  # v31
+        self.loss_x2_streak     = loss_x2_streak      # v32+: thua N ván → x2
         self.loss_streak        = 0
         self.win_streak         = 0
         self.active             = True
@@ -295,12 +298,18 @@ class AutoBetSession:
         self.recovery_wins      = 0
         self.pending_entry      = None
         self._is_reduced        = False  # v31: đang ở chế độ cược giảm
+        self._loss_x2_triggered = False  # v32+: đang trong chuỗi x2 do thua liên tiếp
 
     def on_win(self):
         self.win_streak  += 1
         self.loss_streak  = 0
         if self.paused:
             self.recovery_wins += 1
+            return
+        # v32+: thoát loss_x2 mode khi thắng
+        if self._loss_x2_triggered:
+            self._loss_x2_triggered = False
+            self.current_bet = self.base_bet
             return
         # v31: nếu đang ở reduced mode, thắng → về base (thoát reduced)
         if self._is_reduced:
@@ -325,7 +334,12 @@ class AutoBetSession:
         if self.paused:
             self.recovery_wins = 0
             return
-        # v31: kiểm tra giảm cược trước (ưu tiên cao hơn martingale/reset)
+        # v32+: loss_x2_streak — thua đúng N ván liên tiếp → x2, rồi mỗi ván thua tiếp tục x2
+        if self.loss_x2_streak > 0 and self.loss_streak >= self.loss_x2_streak:
+            self._loss_x2_triggered = True
+            self.current_bet = min(self.current_bet * 2, self.ledger.balance)
+            return
+        # v31: kiểm tra giảm cược (ưu tiên sau loss_x2)
         if (self.loss_streak_reduce > 0
                 and self.loss_streak >= self.loss_streak_reduce
                 and not self._is_reduced):
@@ -363,10 +377,15 @@ class AutoBetSession:
         n    = self.ledger.net()
         sign = "+" if n >= 0 else ""
         icon = "📈" if n >= 0 else "📉"
-        reduce_tag = " 🔻<i>giảm</i>" if self._is_reduced else ""
+        if self._loss_x2_triggered:
+            mode_tag = " 📈<i>x2 chuỗi thua</i>"
+        elif self._is_reduced:
+            mode_tag = " 🔻<i>giảm</i>"
+        else:
+            mode_tag = ""
         return (
             f"{icon} Auto-cược | Ván #{self.ledger.rounds} | "
-            f"Cược: <b>{self.current_bet:,}</b>{reduce_tag} | "
+            f"Cược: <b>{self.current_bet:,}</b>{mode_tag} | "
             f"Bal: <b>{self.ledger.balance:,}</b> | "
             f"{sign}Lãi/Lỗ: <b>{sign}{n:,}</b>"
         )
@@ -2465,13 +2484,28 @@ async def tg_poll_loop():
                             else:
                                 pend['double_on_loss'] = False
                                 pend['reset_on_loss']  = False
-                            pend['step'] = 'await_win_config'
+                            pend['step'] = 'await_loss_x2'
                             await tg_send(chat_id,
-                                f'Khi <b>THẮNG</b>, bạn muốn:\n'
-                                f'1️⃣ X2 tiền cược\n'
-                                f'2️⃣ Giữ nguyên số tiền cược\n'
-                                f'3️⃣ Reset về mức ban đầu\n'
-                                f'Nhập số lựa chọn (1/2/3):')
+                                f'📈 <b>X2 cược sau chuỗi thua liên tiếp?</b>\n'
+                                f'Thua bao nhiêu ván liên tiếp thì bắt đầu x2 cược?\n'
+                                f'Mỗi ván thua tiếp theo sẽ tiếp tục x2, thắng thì reset về gốc.\n'
+                                f'<i>(Nhập 0 nếu không dùng tính năng này)</i>')
+                            continue
+
+                        elif step == 'await_loss_x2':
+                            try:
+                                lx2 = int(raw_txt.strip())
+                                if lx2 < 0: raise ValueError
+                                pend['loss_x2_streak'] = lx2
+                                pend['step'] = 'await_win_config'
+                                await tg_send(chat_id,
+                                    f'Khi <b>THẮNG</b>, bạn muốn:\n'
+                                    f'1️⃣ X2 tiền cược\n'
+                                    f'2️⃣ Giữ nguyên số tiền cược\n'
+                                    f'3️⃣ Reset về mức ban đầu\n'
+                                    f'Nhập số lựa chọn (1/2/3):')
+                            except ValueError:
+                                await tg_send(chat_id, '⚠️ Nhập số nguyên ≥ 0. Nhập 0 để bỏ qua.')
                             continue
 
                         elif step == 'await_win_config':
@@ -2609,6 +2643,7 @@ async def tg_poll_loop():
                                     profit_target       = pt,
                                     loss_streak_reduce  = pend.get('loss_streak_reduce', 0),
                                     reduced_bet         = pend.get('reduced_bet', 0),
+                                    loss_x2_streak      = pend.get('loss_x2_streak', 0),
                                 )
                                 _auto_bet_sessions[chat_id] = sess
                                 del _auto_bet_pending[chat_id]
@@ -2629,6 +2664,7 @@ async def tg_poll_loop():
                                 _wx2  = pend.get('win_streak_x2', 0)
                                 _lsr  = pend.get('loss_streak_reduce', 0)
                                 _rb   = pend.get('reduced_bet', 0)
+                                _lx2  = pend.get('loss_x2_streak', 0)
                                 mode_loss = ("x2 Martingale" if pend.get('double_on_loss')
                                              else ("Reset về gốc" if pend.get('reset_on_loss')
                                              else "Giữ nguyên"))
@@ -2644,6 +2680,8 @@ async def tg_poll_loop():
                                 pt_txt   = f"{pt:,}" if pt > 0 else "Không giới hạn"
                                 lr_txt   = (f"Sau {_lsr} ván thua liên tiếp → giảm xuống {_rb:,}"
                                             if _lsr > 0 else "Không giảm cược")
+                                lx2_txt  = (f"Sau {_lx2} ván thua liên tiếp → x2 mỗi ván (reset khi thắng)"
+                                            if _lx2 > 0 else "Không dùng")
                                 await tg_send(chat_id,
                                     f'✅ <b>Auto-cược đã khởi động!</b>\n'
                                     f'━━━━━━━━━━━━━━\n'
@@ -2652,6 +2690,7 @@ async def tg_poll_loop():
                                     f'🎲 Cược/ván: <b>{pend["bet_amount"]:,}</b>\n'
                                     f'🟢 Thắng → {mode_win}\n'
                                     f'🔴 Thua → {mode_loss}\n'
+                                    f'📈 X2 theo chuỗi thua: {lx2_txt}\n'
                                     f'🔻 Giảm cược: {lr_txt}\n'
                                     f'🚨 Pause khi thua liên tiếp: {ls_txt}\n'
                                     f'▶️ Resume khi thắng: {ws_txt}\n'
@@ -3015,8 +3054,12 @@ async def tg_poll_loop():
                                 '  • Reset active logics → re-tune từ history thật\n'
                                 '  • Reset session offset tuner\n'
                                 '  • Reset adaptive TT1/TT2\n'
-                                '  • KHÔNG đổi ttoan\n'
-                                '  ⚠️ User thường không thấy 2 lệnh này')
+                                '  • KHÔNG đổi ttoan\n\n'
+                                '/tinhchinh &lt;số ván&gt; — Tinh chỉnh chuỗi thua đổi ttoan\n'
+                                '  • VD: /tinhchinh 5 → thua 5 ván liên tiếp mới đổi ttoan khẩn\n'
+                                '  • Mặc định: 3 ván (TTOAN_CONSEC_LOSS_BAIL)\n'
+                                '  • Reset chuỗi thua hiện tại khi đổi\n'
+                                '  ⚠️ User thường không thấy 3 lệnh này')
 
                         # ── /reloadlogic — CHỈ ép đổi ttoan ngay lập tức ──────────────
                         # (giống khi sai 3 lần liên tiếp, KHÔNG clear rolling history)
@@ -3150,6 +3193,46 @@ async def tg_poll_loop():
                                 f'━━━━━━━━━━━━━━\n'
                                 f'💡 Dùng /reloadlogic để ép đổi ttoan.\n'
                                 f'<i>(Lệnh này chỉ admin thấy)</i>')
+
+                        # ── /tinhchinh — Tinh chỉnh số ván thua liên tiếp đổi ttoan ──
+                        elif cmd == '/tinhchinh':
+                            global TTOAN_CONSEC_LOSS_BAIL
+                            if len(parts) < 2:
+                                await tg_send(chat_id,
+                                    f'⚙️ <b>TINH CHỈNH — Chuỗi thua đổi ttoan</b>\n'
+                                    f'━━━━━━━━━━━━━━\n'
+                                    f'Hiện tại: <b>{TTOAN_CONSEC_LOSS_BAIL}</b> ván thua liên tiếp → đổi ttoan khẩn\n\n'
+                                    f'Dùng: <code>/tinhchinh &lt;số ván&gt;</code>\n'
+                                    f'Ví dụ: <code>/tinhchinh 5</code> → sau 5 ván thua liên tiếp mới đổi\n'
+                                    f'<i>(Tối thiểu 1, mặc định 3)</i>\n'
+                                    f'<i>(Lệnh này chỉ admin thấy)</i>')
+                                continue
+                            try:
+                                new_val = int(parts[1])
+                                if new_val < 1:
+                                    await tg_send(chat_id, '⚠️ Giá trị tối thiểu là 1.')
+                                    continue
+                                old_val = TTOAN_CONSEC_LOSS_BAIL
+                                TTOAN_CONSEC_LOSS_BAIL = new_val
+                                # Reset chuỗi sai hiện tại để tránh trigger ngay lập tức
+                                _ttoan_tracker['real_vans_since_swap'] = 0
+                                _ttoan_tracker['history_since_swap']   = []
+                                _ttoan_tracker['vans_since_swap']      = 0
+                                _ttoan_tracker['pre_trim_count']       = 0
+                                print(f"[TINHCHINH] Admin đổi TTOAN_CONSEC_LOSS_BAIL: {old_val} → {new_val} "
+                                      f"@ live#{app_state['live_count']}")
+                                await tg_send(chat_id,
+                                    f'✅ <b>TINH CHỈNH — Hoàn tất</b>\n'
+                                    f'━━━━━━━━━━━━━━\n'
+                                    f'Chuỗi thua đổi ttoan:\n'
+                                    f'  Cũ: <b>{old_val}</b> ván\n'
+                                    f'  Mới: <b>{new_val}</b> ván\n\n'
+                                    f'⚡ Chuỗi thua hiện tại đã reset về 0.\n'
+                                    f'Tool sẽ đổi ttoan khẩn sau <b>{new_val}</b> ván thua liên tiếp.\n'
+                                    f'<i>(Lệnh này chỉ admin thấy)</i>')
+                            except ValueError:
+                                await tg_send(chat_id, '⚠️ Nhập số nguyên dương. VD: /tinhchinh 5')
+                            continue
 
                         else:
                             # admin dùng lệnh user bình thường
