@@ -3,14 +3,16 @@
 TX Ensemble Tool — Python Backend (v28 - Real WS AutoBet + Exponential Win + Profit Target)
 - Kết nối WS game: wss://wtxmd52.tele68.com/txmd5/
 - HTTP server: http://localhost:2300
-- 12 Logic Engine (L1–L12) + Session Tuner + Adaptive TT1/TT2 Grouping
+- 16 Logic Engine (L1–L16) + Session Tuner + Adaptive TT1/TT2 Grouping
   · 3 logic cũ: L1/L2/L3 (giữ nguyên công thức)
   · 3 logic mới: L4/L5/L6 (thêm v16)
   · 3 logic mới: L7/L8/L9 (thêm v32)
   · 3 logic mới: L10/L11/L12 (thêm v33+)
+  · 3 logic mới: L13/L14/L15 (thêm v34 — công thức tổng hợp mới)
+  · 1 logic mới: L16 (thêm v35 — K = |(X+1)−(Y÷3)| min (Z÷7))
   · WARMUP: chờ 10 phiên live trước khi bắt đầu dự đoán (chỉ chạy 1 LẦN khi bật tool)
             Sau khi đổi ttoan KHÔNG warmup lại — dự đoán tiếp ngay từ ván kế tiếp.
-  · Tune chọn 3 logic mạnh nhất trong 12 → ensemble majority từ top-3
+  · Tune chọn 3 logic mạnh nhất trong 16 → ensemble majority từ top-3
   · Tune kết hợp với session tuner offset (-1/0/+1)
   · BÙ TRỪ LÔ CHÉO ĐÃ XÓA — tool giờ luôn THEO majority thuần
   · Adaptive TT1/TT2 grouping vẫn còn (phân loại case, thống kê)
@@ -1267,6 +1269,67 @@ def _run_logic_L12(X, md5h):
     K = int(abs(_safe_div(inner, z_div))) if z_div != 0 else int(abs(inner))
     return 'XIU' if K % 2 == 0 else 'TAI'
 
+# ─── v34: 3 Logic Mới (L13 / L14 / L15) ─────────────────────────────────────
+# Y = MD5[6:8] hex  Z = MD5[30:32] hex
+#
+# L13: K = |(X + 3) min (Y ÷ 3)| × |(X + 3) − (Y ÷ 3)| × (Z ÷ 2)   chẵn→TÀI / lẻ→XỈU
+# L14: K = |(X − 5) ÷ (Y − 3)| × (Z ÷ 3)                              chẵn→TÀI / lẻ→XỈU
+# L15: K = |(X + 1) ^ (Y + 1)| ÷ (Z × 5)                              chẵn→TÀI / lẻ→XỈU
+
+def _run_logic_L13(X, md5h):
+    # L13: K = |(X + 3) min (Y ÷ 3)| × |(X + 3) − (Y ÷ 3)| × (Z ÷ 2)
+    # Công thức gốc: K=|(X+3) min (Y÷3)| |a−b| (Z÷2)
+    # trong đó a = X+3, b = Y÷3 → |a−b| = |(X+3) − (Y÷3)|
+    # Y=MD5[6..7]  Z=MD5[30..31]  chẵn→TÀI / lẻ→XỈU
+    Y = int(md5h[6:8], 16)
+    Z = int(md5h[30:32], 16)
+    y_div3  = _safe_div(Y, 3)
+    a       = X + 3
+    term1   = abs(min(a, y_div3))          # |(X+3) min (Y÷3)|
+    term2   = abs(a - y_div3)              # |(X+3) − (Y÷3)|
+    z_div2  = _safe_div(Z, 2)
+    K       = int(term1 * term2 * z_div2)
+    return 'TAI' if K % 2 == 0 else 'XIU'
+
+def _run_logic_L14(X, md5h):
+    # L14: K = |(X − 5) ÷ (Y − 3)| × (Z ÷ 3)
+    # Y=MD5[6..7]  Z=MD5[30..31]  chẵn→TÀI / lẻ→XỈU
+    Y = int(md5h[6:8], 16)
+    Z = int(md5h[30:32], 16)
+    inner  = _safe_div(X - 5, Y - 3)      # ÷ 0 → 0 via _safe_div
+    z_div3 = _safe_div(Z, 3)
+    K      = int(abs(inner) * z_div3)
+    return 'TAI' if K % 2 == 0 else 'XIU'
+
+def _run_logic_L15(X, md5h):
+    # L15: K = |(X + 1) ^ (Y + 1)| ÷ (Z × 5)
+    # ^ = XOR bitwise  (consistent với L1 dùng ** — dùng XOR để phân biệt logic)
+    # Y=MD5[6..7]  Z=MD5[30..31]  chẵn→TÀI / lẻ→XỈU
+    Y      = int(md5h[6:8], 16)
+    Z      = int(md5h[30:32], 16)
+    inner  = (X + 1) ^ (Y + 1)            # XOR bitwise
+    z_mul5 = Z * 5
+    K      = int(abs(_safe_div(inner, z_mul5)))
+    return 'TAI' if K % 2 == 0 else 'XIU'
+
+# ─── v35: 1 Logic Mới (L16) ──────────────────────────────────────────────────
+# L16: K = |(X + 1) − (Y ÷ 3)| min (Z ÷ 7)
+#      Y = MD5[6:8] hex  Z = MD5[30:32] hex   chẵn→TÀI / lẻ→XỈU
+#
+# Cấu trúc: inner = |(X+1) − (Y÷3)|  →  K = min(inner, Z÷7)
+# min-gate với Z÷7 clamp K về range nhỏ → phân tán chẵn/lẻ tự nhiên
+
+def _run_logic_L16(X, md5h):
+    # L16: K = |(X + 1) − (Y ÷ 3)| min (Z ÷ 7)
+    # Y=MD5[6..7]  Z=MD5[30..31]  chẵn→TÀI / lẻ→XỈU
+    Y      = int(md5h[6:8], 16)
+    Z      = int(md5h[30:32], 16)
+    y_div3 = _safe_div(Y, 3)
+    inner  = abs((X + 1) - y_div3)        # |(X+1) − (Y÷3)|
+    z_div7 = _safe_div(Z, 7)
+    K      = int(min(inner, z_div7))      # min-gate
+    return 'TAI' if K % 2 == 0 else 'XIU'
+
 # ─── v32: Logic Tuner — chọn top-3 trong 9 logic + BẺ CHIỀU khi reversed WR cao hơn ──
 # Sau WARMUP_COUNT phiên, mỗi LOGIC_TUNE_INTERVAL phiên:
 #   → đánh giá WR của từng logic (L1–L9) trên rolling window 30 phiên gần nhất
@@ -1276,6 +1339,8 @@ def _run_logic_L12(X, md5h):
 # BẺ ĐK: reversed_wr > REVERSE_THRESHOLD và reversed_wr > best_normal_wr_in_top3
 # Mặc định ban đầu: dùng L1+L2+L3 (giống v15/v16)
 # v32: pool mở rộng từ 6 → 9 logic (thêm L7/L8/L9)
+# v34: pool mở rộng từ 12 → 15 logic (thêm L13/L14/L15)
+# v35: pool mở rộng từ 15 → 16 logic (thêm L16)
 LOGIC_TUNE_WINDOW    = 30    # rolling window để tính WR từng logic
 REVERSE_THRESHOLD    = 0.55  # ngưỡng reversed WR tối thiểu để bẻ (tránh noise)
 
@@ -1290,6 +1355,8 @@ _logic_tuner = {
         'L4': [], 'L5': [], 'L6': [],
         'L7': [], 'L8': [], 'L9': [],    # v32: 3 logic mới
         'L10': [], 'L11': [], 'L12': [], # v33+: 3 logic mới (L10/L11/L12)
+        'L13': [], 'L14': [], 'L15': [], # v34: 3 logic mới (L13/L14/L15)
+        'L16': [],                       # v35: L16 min-gate
     },
     # Snapshot pending: lưu pred của tất cả 9 logic cho phiên chưa có kết quả
     # { sess_id: { 'L1': 'TAI'/'XIU', ..., 'L9': ... } }
@@ -1328,11 +1395,11 @@ _ttoan_tracker = {
     'real_vans_since_swap':  0,   # chỉ đếm ván thật (reset 0 khi đổi ttoan)
 }
 
-ALL_LOGICS = ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7', 'L8', 'L9', 'L10', 'L11', 'L12']
+ALL_LOGICS = ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7', 'L8', 'L9', 'L10', 'L11', 'L12', 'L13', 'L14', 'L15', 'L16']
 
 def _run_one_logic(name: str, X: int, Y: int, Z: int, md5h: str = '') -> str:
     """Chạy một logic theo tên, trả về 'TAI' hoặc 'XIU'.
-    L7/L8/L9/L10/L11/L12 cần md5h để tự lấy Y/Z từ vị trí riêng.
+    L7–L16 cần md5h để tự lấy Y/Z từ vị trí riêng.
     """
     if name == 'L7':
         return _run_logic_L7(X, md5h)
@@ -1346,6 +1413,14 @@ def _run_one_logic(name: str, X: int, Y: int, Z: int, md5h: str = '') -> str:
         return _run_logic_L11(X, md5h)
     if name == 'L12':
         return _run_logic_L12(X, md5h)
+    if name == 'L13':
+        return _run_logic_L13(X, md5h)
+    if name == 'L14':
+        return _run_logic_L14(X, md5h)
+    if name == 'L15':
+        return _run_logic_L15(X, md5h)
+    if name == 'L16':
+        return _run_logic_L16(X, md5h)
     return {
         'L1': _run_logic_L1,
         'L2': _run_logic_L2,
@@ -1356,7 +1431,7 @@ def _run_one_logic(name: str, X: int, Y: int, Z: int, md5h: str = '') -> str:
     }[name](X, Y, Z)
 
 def logic_tuner_register_pred(sess_id: str, X: int, Y: int, Z: int, md5h: str = ''):
-    """Lưu pred của cả 9 logic cho phiên này vào pending (để so với kết quả thực sau)."""
+    """Lưu pred của cả 16 logic cho phiên này vào pending (để so với kết quả thực sau)."""
     preds = {name: _run_one_logic(name, X, Y, Z, md5h) for name in ALL_LOGICS}
     _logic_tuner['pending'][sess_id] = preds
     # Giữ pending tối đa 200
