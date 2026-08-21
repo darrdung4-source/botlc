@@ -8,11 +8,10 @@ TX Ensemble Tool — Python Backend (v28 - Real WS AutoBet + Exponential Win + P
   · 3 logic mới: L4/L5/L6 (thêm v16)
   · 3 logic mới: L7/L8/L9 (thêm v32)
   · 3 logic mới: L10/L11/L12 (thêm v33+)
-  · 3 logic mới: L13/L14/L15 (thêm v34 — công thức tổng hợp mới)
-  · 1 logic mới: L16 (thêm v35 — K = |(X+1)−(Y÷3)| min (Z÷7))
+  · 4 logic mới: L13/L14/L15/L16 (thêm v37)
   · WARMUP: chờ 10 phiên live trước khi bắt đầu dự đoán (chỉ chạy 1 LẦN khi bật tool)
             Sau khi đổi ttoan KHÔNG warmup lại — dự đoán tiếp ngay từ ván kế tiếp.
-  · Tune chọn 3 logic mạnh nhất trong 16 → ensemble majority từ top-3
+  · Tune chọn 3 logic mạnh nhất trong 12 → ensemble majority từ top-3
   · Tune kết hợp với session tuner offset (-1/0/+1)
   · BÙ TRỪ LÔ CHÉO ĐÃ XÓA — tool giờ luôn THEO majority thuần
   · Adaptive TT1/TT2 grouping vẫn còn (phân loại case, thống kê)
@@ -255,6 +254,7 @@ class AutoBetSession:
     v31: + win_streak_x2  (thắng bao nhiêu ván liên tiếp mới x2 — thay vì x2 ngay lần đầu)
          + loss_streak_reduce / reduced_bet (thua N ván → giảm cược xuống mức reduced_bet)
          + loss_streak_stop / win_streak_cont vẫn còn (pause/resume như v29)
+    v32+: + loss_x2_streak (thua N ván liên tiếp → x2 cược, 0=không dùng tính năng này)
     """
     def __init__(
         self,
@@ -273,6 +273,7 @@ class AutoBetSession:
         profit_target: int = 0,    # dừng khi lãi >= target (0=không giới hạn)
         loss_streak_reduce: int = 0,  # v31: thua N ván liên tiếp → giảm cược (0=không)
         reduced_bet: int = 0,         # v31: mức cược giảm xuống khi đủ loss_streak_reduce
+        loss_x2_streak: int = 0,      # v32+: thua N ván liên tiếp → x2 cược (0=không)
     ):
         self.chat_id            = chat_id
         self.jwt                = jwt
@@ -290,6 +291,7 @@ class AutoBetSession:
         self.profit_target      = profit_target
         self.loss_streak_reduce = loss_streak_reduce  # v31
         self.reduced_bet        = reduced_bet if reduced_bet > 0 else base_bet  # v31
+        self.loss_x2_streak     = loss_x2_streak      # v32+: thua N ván → x2
         self.loss_streak        = 0
         self.win_streak         = 0
         self.active             = True
@@ -297,12 +299,18 @@ class AutoBetSession:
         self.recovery_wins      = 0
         self.pending_entry      = None
         self._is_reduced        = False  # v31: đang ở chế độ cược giảm
+        self._loss_x2_triggered = False  # v32+: đang trong chuỗi x2 do thua liên tiếp
 
     def on_win(self):
         self.win_streak  += 1
         self.loss_streak  = 0
         if self.paused:
             self.recovery_wins += 1
+            return
+        # v32+: thoát loss_x2 mode khi thắng
+        if self._loss_x2_triggered:
+            self._loss_x2_triggered = False
+            self.current_bet = self.base_bet
             return
         # v31: nếu đang ở reduced mode, thắng → về base (thoát reduced)
         if self._is_reduced:
@@ -327,7 +335,15 @@ class AutoBetSession:
         if self.paused:
             self.recovery_wins = 0
             return
-        # v31: kiểm tra giảm cược trước (ưu tiên cao hơn martingale/reset)
+        # v32+: loss_x2_streak — thua đúng N ván liên tiếp → x2 MỘT LẦN, giữ nguyên mức đó
+        if self.loss_x2_streak > 0 and self.loss_streak >= self.loss_x2_streak:
+            if not self._loss_x2_triggered:
+                # lần đầu đủ chuỗi → x2 một lần duy nhất
+                self._loss_x2_triggered = True
+                self.current_bet = min(self.base_bet * 2, self.ledger.balance)
+            # đã trigger rồi → giữ nguyên mức x2, không x2 thêm
+            return
+        # v31: kiểm tra giảm cược (ưu tiên sau loss_x2)
         if (self.loss_streak_reduce > 0
                 and self.loss_streak >= self.loss_streak_reduce
                 and not self._is_reduced):
@@ -365,10 +381,15 @@ class AutoBetSession:
         n    = self.ledger.net()
         sign = "+" if n >= 0 else ""
         icon = "📈" if n >= 0 else "📉"
-        reduce_tag = " 🔻<i>giảm</i>" if self._is_reduced else ""
+        if self._loss_x2_triggered:
+            mode_tag = " 📈<i>x2 chuỗi thua</i>"
+        elif self._is_reduced:
+            mode_tag = " 🔻<i>giảm</i>"
+        else:
+            mode_tag = ""
         return (
             f"{icon} Auto-cược | Ván #{self.ledger.rounds} | "
-            f"Cược: <b>{self.current_bet:,}</b>{reduce_tag} | "
+            f"Cược: <b>{self.current_bet:,}</b>{mode_tag} | "
             f"Bal: <b>{self.ledger.balance:,}</b> | "
             f"{sign}Lãi/Lỗ: <b>{sign}{n:,}</b>"
         )
@@ -393,6 +414,7 @@ TTOAN_WR_SWAP_THRESH  = 0.40   # WR 10 ván < 40% → đổi ttoan ngay lập t�
 TTOAN_CHECK_WINDOW    = 10     # số ván gần nhất để tính WR kiểm tra
 TTOAN_CONSEC_LOSS_BAIL = 3     # v35: sai liên tiếp 3 ván thật → đổi ttoan khẩn (không cần đủ window)
 HISTORY_SAVE_INTERVAL = 1    # lưu file sau mỗi phiên (persistent ngay lập tức)
+BE_DOMINANT_MIN_GAP   = 0.0  # gap tối thiểu WR bẻ phải hơn logic thuần (0.0=chỉ cần >; 0.10=>=10%; 0.15=>=15%)
 
 # ─── Telegram Config ──────────────────────────────────────────────────────────
 TG_TOKEN     = '8943843485:AAF9Lhoa6DlGidZWoy8Ok_-fd5qWqau4bSs'
@@ -1269,65 +1291,54 @@ def _run_logic_L12(X, md5h):
     K = int(abs(_safe_div(inner, z_div))) if z_div != 0 else int(abs(inner))
     return 'XIU' if K % 2 == 0 else 'TAI'
 
-# ─── v34: 3 Logic Mới (L13 / L14 / L15) ─────────────────────────────────────
+# ─── v37: 4 Logic Mới (L13 / L14 / L15 / L16) ───────────────────────────────
 # Y = MD5[6:8] hex  Z = MD5[30:32] hex
 #
-# L13: K = |(X + 3) min (Y ÷ 3)| × |(X + 3) − (Y ÷ 3)| × (Z ÷ 2)   chẵn→TÀI / lẻ→XỈU
-# L14: K = |(X − 5) ÷ (Y − 3)| × (Z ÷ 3)                              chẵn→TÀI / lẻ→XỈU
-# L15: K = |(X + 1) ^ (Y + 1)| ÷ (Z × 5)                              chẵn→TÀI / lẻ→XỈU
+# L13: K = min(X+3, Y÷3) × |X−Y| × (Z÷2)            chẵn→TÀI / lẻ→XỈU
+# L14: K = |(X − 5) ÷ (Y − 3)| × (Z ÷ 3)            chẵn→TÀI / lẻ→XỈU
+# L15: K = |(X + 1) ^ (Y + 1)| ÷ (Z × 5)            chẵn→TÀI / lẻ→XỈU
+# L16: K = |(X + 1) − (Y ÷ 3)| min (Z ÷ 7)          chẵn→TÀI / lẻ→XỈU
 
 def _run_logic_L13(X, md5h):
-    # L13: K = |(X + 3) min (Y ÷ 3)| × |(X + 3) − (Y ÷ 3)| × (Z ÷ 2)
-    # Công thức gốc: K=|(X+3) min (Y÷3)| |a−b| (Z÷2)
-    # trong đó a = X+3, b = Y÷3 → |a−b| = |(X+3) − (Y÷3)|
-    # Y=MD5[6..7]  Z=MD5[30..31]  chẵn→TÀI / lẻ→XỈU
+    # L13: K = min(X+3, Y÷3) × |X−Y| × (Z÷2)  chẵn→TÀI / lẻ→XỈU
+    # Y=MD5[6..7]  Z=MD5[30..31]
     Y = int(md5h[6:8], 16)
     Z = int(md5h[30:32], 16)
-    y_div3  = _safe_div(Y, 3)
-    a       = X + 3
-    term1   = abs(min(a, y_div3))          # |(X+3) min (Y÷3)|
-    term2   = abs(a - y_div3)              # |(X+3) − (Y÷3)|
-    z_div2  = _safe_div(Z, 2)
-    K       = int(term1 * term2 * z_div2)
+    a = min(X + 3, _safe_div(Y, 3))
+    b = abs(X - Y)
+    c = _safe_div(Z, 2)
+    K = int(abs(a) * b * c)
     return 'TAI' if K % 2 == 0 else 'XIU'
 
 def _run_logic_L14(X, md5h):
-    # L14: K = |(X − 5) ÷ (Y − 3)| × (Z ÷ 3)
-    # Y=MD5[6..7]  Z=MD5[30..31]  chẵn→TÀI / lẻ→XỈU
+    # L14: K = |(X − 5) ÷ (Y − 3)| × (Z ÷ 3)  chẵn→TÀI / lẻ→XỈU
+    # Y=MD5[6..7]  Z=MD5[30..31]
     Y = int(md5h[6:8], 16)
     Z = int(md5h[30:32], 16)
-    inner  = _safe_div(X - 5, Y - 3)      # ÷ 0 → 0 via _safe_div
-    z_div3 = _safe_div(Z, 3)
-    K      = int(abs(inner) * z_div3)
+    inner = _safe_div(X - 5, Y - 3)
+    z_div = _safe_div(Z, 3)
+    K = int(abs(inner) * z_div)
     return 'TAI' if K % 2 == 0 else 'XIU'
 
 def _run_logic_L15(X, md5h):
-    # L15: K = |(X + 1) ^ (Y + 1)| ÷ (Z × 5)
-    # ^ = XOR bitwise  (consistent với L1 dùng ** — dùng XOR để phân biệt logic)
-    # Y=MD5[6..7]  Z=MD5[30..31]  chẵn→TÀI / lẻ→XỈU
-    Y      = int(md5h[6:8], 16)
-    Z      = int(md5h[30:32], 16)
-    inner  = (X + 1) ^ (Y + 1)            # XOR bitwise
-    z_mul5 = Z * 5
-    K      = int(abs(_safe_div(inner, z_mul5)))
+    # L15: K = |(X + 1) ^ (Y + 1)| ÷ (Z × 5)  chẵn→TÀI / lẻ→XỈU
+    # Y=MD5[6..7]  Z=MD5[30..31]
+    # ^ = XOR operator pada konteks integer
+    Y = int(md5h[6:8], 16)
+    Z = int(md5h[30:32], 16)
+    inner = (X + 1) ^ (Y + 1)
+    z_mul = Z * 5
+    K = int(abs(_safe_div(inner, z_mul))) if z_mul != 0 else int(abs(inner))
     return 'TAI' if K % 2 == 0 else 'XIU'
 
-# ─── v35: 1 Logic Mới (L16) ──────────────────────────────────────────────────
-# L16: K = |(X + 1) − (Y ÷ 3)| min (Z ÷ 7)
-#      Y = MD5[6:8] hex  Z = MD5[30:32] hex   chẵn→TÀI / lẻ→XỈU
-#
-# Cấu trúc: inner = |(X+1) − (Y÷3)|  →  K = min(inner, Z÷7)
-# min-gate với Z÷7 clamp K về range nhỏ → phân tán chẵn/lẻ tự nhiên
-
 def _run_logic_L16(X, md5h):
-    # L16: K = |(X + 1) − (Y ÷ 3)| min (Z ÷ 7)
-    # Y=MD5[6..7]  Z=MD5[30..31]  chẵn→TÀI / lẻ→XỈU
-    Y      = int(md5h[6:8], 16)
-    Z      = int(md5h[30:32], 16)
-    y_div3 = _safe_div(Y, 3)
-    inner  = abs((X + 1) - y_div3)        # |(X+1) − (Y÷3)|
-    z_div7 = _safe_div(Z, 7)
-    K      = int(min(inner, z_div7))      # min-gate
+    # L16: K = |(X + 1) − (Y ÷ 3)| min (Z ÷ 7)  chẵn→TÀI / lẻ→XỈU
+    # Y=MD5[6..7]  Z=MD5[30..31]
+    Y = int(md5h[6:8], 16)
+    Z = int(md5h[30:32], 16)
+    inner = abs((X + 1) - _safe_div(Y, 3))
+    z_div = _safe_div(Z, 7)
+    K = int(min(inner, z_div))
     return 'TAI' if K % 2 == 0 else 'XIU'
 
 # ─── v32: Logic Tuner — chọn top-3 trong 9 logic + BẺ CHIỀU khi reversed WR cao hơn ──
@@ -1339,8 +1350,6 @@ def _run_logic_L16(X, md5h):
 # BẺ ĐK: reversed_wr > REVERSE_THRESHOLD và reversed_wr > best_normal_wr_in_top3
 # Mặc định ban đầu: dùng L1+L2+L3 (giống v15/v16)
 # v32: pool mở rộng từ 6 → 9 logic (thêm L7/L8/L9)
-# v34: pool mở rộng từ 12 → 15 logic (thêm L13/L14/L15)
-# v35: pool mở rộng từ 15 → 16 logic (thêm L16)
 LOGIC_TUNE_WINDOW    = 30    # rolling window để tính WR từng logic
 REVERSE_THRESHOLD    = 0.55  # ngưỡng reversed WR tối thiểu để bẻ (tránh noise)
 
@@ -1355,8 +1364,7 @@ _logic_tuner = {
         'L4': [], 'L5': [], 'L6': [],
         'L7': [], 'L8': [], 'L9': [],    # v32: 3 logic mới
         'L10': [], 'L11': [], 'L12': [], # v33+: 3 logic mới (L10/L11/L12)
-        'L13': [], 'L14': [], 'L15': [], # v34: 3 logic mới (L13/L14/L15)
-        'L16': [],                       # v35: L16 min-gate
+        'L13': [], 'L14': [], 'L15': [], 'L16': [],  # v37: 4 logic mới
     },
     # Snapshot pending: lưu pred của tất cả 9 logic cho phiên chưa có kết quả
     # { sess_id: { 'L1': 'TAI'/'XIU', ..., 'L9': ... } }
@@ -1395,11 +1403,12 @@ _ttoan_tracker = {
     'real_vans_since_swap':  0,   # chỉ đếm ván thật (reset 0 khi đổi ttoan)
 }
 
-ALL_LOGICS = ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7', 'L8', 'L9', 'L10', 'L11', 'L12', 'L13', 'L14', 'L15', 'L16']
+ALL_LOGICS = ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7', 'L8', 'L9', 'L10', 'L11', 'L12',
+              'L13', 'L14', 'L15', 'L16']  # v37: 4 logic mới
 
 def _run_one_logic(name: str, X: int, Y: int, Z: int, md5h: str = '') -> str:
     """Chạy một logic theo tên, trả về 'TAI' hoặc 'XIU'.
-    L7–L16 cần md5h để tự lấy Y/Z từ vị trí riêng.
+    L7/L8/L9/L10/L11/L12 cần md5h để tự lấy Y/Z từ vị trí riêng.
     """
     if name == 'L7':
         return _run_logic_L7(X, md5h)
@@ -1431,7 +1440,7 @@ def _run_one_logic(name: str, X: int, Y: int, Z: int, md5h: str = '') -> str:
     }[name](X, Y, Z)
 
 def logic_tuner_register_pred(sess_id: str, X: int, Y: int, Z: int, md5h: str = ''):
-    """Lưu pred của cả 16 logic cho phiên này vào pending (để so với kết quả thực sau)."""
+    """Lưu pred của cả 9 logic cho phiên này vào pending (để so với kết quả thực sau)."""
     preds = {name: _run_one_logic(name, X, Y, Z, md5h) for name in ALL_LOGICS}
     _logic_tuner['pending'][sess_id] = preds
     # Giữ pending tối đa 200
@@ -1899,17 +1908,15 @@ def run_three_logic(sess_str, md5h):
     if n_bẻ == 1:
         bẻ_name = reversed_in_top3[0]
         top3_wr = {n: eff_wr_map.get(n, 0.0) for n in active}
-        bẻ_wr   = top3_wr.get(bẻ_name, 0.0)
-        # WR của 2 logic thường còn lại (không bẻ) trong top-3
-        normal_wrs = [top3_wr[n] for n in active if n != bẻ_name]
-        max_normal = max(normal_wrs) if normal_wrs else 0.0
-        if bẻ_wr > max_normal:
-            # Bẻ độc tôn — WR STRICTLY cao hơn tất cả logic thường → flip
+        max_wr  = max(top3_wr.values()) if top3_wr else 0.0
+        if top3_wr.get(bẻ_name, 0.0) > max_wr:
+            # Bẻ độc tôn — WR STRICTLY cao hơn tất cả → flip
             apply_flip = {bẻ_name}
-            print(f"[BẺ ĐỘC TÔN] {bẻ_name} WR={bẻ_wr:.1f}% > max_normal={max_normal:.1f}% → flip")
+            print(f"[BẺ ĐỘC TÔN] {bẻ_name} WR={top3_wr[bẻ_name]:.1f}% cao hơn hết → flip")
         else:
-            # Bằng hoặc thấp hơn logic thường → theo đa số, không bẻ
-            print(f"[BẺ BỎ QUA] {bẻ_name} WR={bẻ_wr:.1f}% ≤ max_normal={max_normal:.1f}% → chạy raw")
+            # Bằng hoặc thấp hơn → không flip, theo raw (majority)
+            print(f"[BẺ BỎ QUA] {bẻ_name} WR={top3_wr.get(bẻ_name,0):.1f}% bằng/thấp hơn "
+                  f"(max={max_wr:.1f}%) → theo đa số raw")
     elif n_bẻ >= 2:
         print(f"[BẺ BỎ QUA] {n_bẻ} logic bẻ trong top-3 {reversed_in_top3} → chạy raw toàn bộ")
     # n_bẻ == 0: không làm gì, apply_flip rỗng
@@ -2283,49 +2290,14 @@ def get_ensemble_cross_comp(logic_result):
 
         return ensemble, group, False, 1.0
 
-    # ── CASE 3: Top-3 có 2 logic bẻ ─────────────────────────────────────────
-    # Phân biệt 2 sub-case:
-    #   3a. 2 logic bẻ ĐỒNG THUẬN nhau (cùng pred TAI hoặc cùng XIU)
-    #       → THEO kết quả của 2 logic bẻ (không theo thiểu số).
-    #   3b. 2 logic bẻ KHÔNG ĐỒNG THUẬN (1 bẻ đồng thuận vs logic thường,
-    #       còn logic bẻ kia bất đồng) → theo THIỂU SỐ tức theo BẺ2.
+    # ── CASE 3: Top-3 có 2 logic bẻ → theo đa số bình thường ───────────────
     if n_be == 2:
-        tai_c = active_preds.count('TAI')
-        xiu_c = active_preds.count('XIU')
+        tai_c    = active_preds.count('TAI')
+        xiu_c    = active_preds.count('XIU')
         vote_str = f"{max(tai_c,xiu_c)}-{min(tai_c,xiu_c)}"
-
-        # Tìm pred của 2 logic bẻ và 1 logic thường
-        be_indices    = [i for i, n in enumerate(active) if n in reversed_set]
-        thuan_indices = [i for i, n in enumerate(active) if n not in reversed_set]
-
-        be_preds    = [active_preds[i] for i in be_indices]    # pred 2 logic bẻ (đã flip)
-        thuan_preds = [active_preds[i] for i in thuan_indices] # pred logic thường
-
-        # Sub-case 3a: 2 logic bẻ đồng thuận nhau
-        if be_preds[0] == be_preds[1]:
-            consensus_be = be_preds[0]
-            if tai_c == 3 or xiu_c == 3:
-                # 3-0: cả 3 cùng đoán (2 bẻ + 1 thường cùng chiều) → bẻ ngược như cũ
-                flip_pred = _flip(majority)
-                print(f"[ENSEMBLE] {group} → 🔁 2-BẺ ĐỒNG THUẬN 3-0: vote=3-0 majority={majority} "
-                      f"→ BẺ NGƯỢC = {flip_pred}")
-                return flip_pred, group, False, 1.0
-            else:
-                # 2-1: 2 bẻ đồng thuận, logic thường khác chiều → theo 2 bẻ
-                print(f"[ENSEMBLE] {group} → ✅ 2-BẺ ĐỒNG THUẬN 2-1: cả 2 bẻ đều dự đoán "
-                      f"{consensus_be} (vote={vote_str} majority={majority}) → THEO 2-BẺ = {consensus_be}")
-                return consensus_be, group, False, 1.0
-
-        # Sub-case 3b: 2 logic bẻ không đồng thuận
-        # BẺ1 đồng pred với logic thường → 2 người cùng chiều (majority)
-        # BẺ2 đứng một mình → chính là thiểu số
-        # → theo thiểu số (pred khác với 2 logic đồng thuận kia)
-        minority_pred = _minority_vote(active_preds, majority)
-        thuan_pred = thuan_preds[0] if thuan_preds else None
-        print(f"[ENSEMBLE] {group} → ⚔️  2-BẺ KHÔNG ĐỒNG THUẬN: "
-              f"thường={thuan_pred} bẻ1={be_preds[0]} bẻ2={be_preds[1]} "
-              f"(vote={vote_str} majority={majority}) → THIỂU SỐ = {minority_pred}")
-        return minority_pred, group, False, 1.0
+        print(f"[ENSEMBLE] {group} → 🔁 2-BẺ → THEO ĐA SỐ (bth) "
+              f"vote={vote_str} → {majority}")
+        return majority, group, False, 1.0
 
     # ── CASE 4 & 5: Top-3 có đúng 1 logic bẻ ────────────────────────────────
     # n_be == 1
@@ -2345,11 +2317,9 @@ def get_ensemble_cross_comp(logic_result):
             thuan_logics = [n for n in active if n not in reversed_set]
             thuan_wrs    = [eff_wr.get(n) for n in thuan_logics if eff_wr.get(n) is not None]
 
-            # CASE 4 — BẺ ĐỘC TÔN MẠNH: WR bẻ cao hơn TẤT CẢ logic thuận > 15%
-            # Điều kiện: be_wr phải hơn MỖI logic thuần ít nhất 15 điểm % (0.15)
-            # Nếu chỉ hơn 1 trong 2 logic thuần, hoặc không đủ 15% → YẾU
-            BE_DOMINANT_MIN_GAP = 0.15   # 15% gap so với mỗi logic thuần
-            if thuan_wrs and all(be_wr - tw >= BE_DOMINANT_MIN_GAP for tw in thuan_wrs):
+            # CASE 4 — BẺ ĐỘC TÔN: WR bẻ cao hơn TẤT CẢ logic thuận tối thiểu BE_DOMINANT_MIN_GAP
+            # BE_DOMINANT_MIN_GAP=0.0 → strictly >; 0.10 → phải hơn >=10% (/tinhchinh gap <số>)
+            if thuan_wrs and all(be_wr - tw > BE_DOMINANT_MIN_GAP for tw in thuan_wrs):
                 try:
                     be_idx        = active.index(be_name)
                     dominant_pred = active_preds[be_idx]   # đã flip sẵn
@@ -2357,27 +2327,27 @@ def get_ensemble_cross_comp(logic_result):
                 except (ValueError, IndexError):
                     be_dominant = False
 
-    # CASE 4: BẺ ĐỘC TÔN MẠNH → theo pred của logic bẻ (chỉ khi hơn 2 logic thuần ≥15%)
+    # CASE 4: BẺ ĐỘC TÔN — WR bẻ > cả 2 logic thuần → THEO bẻ tuyệt đối
     if be_dominant and dominant_pred:
         gaps = [round((be_wr - tw) * 100, 1) for tw in thuan_wrs]
-        print(f"[ENSEMBLE] {group} → 🔱 BẺ ĐỘC TÔN MẠNH [{be_name} eff_wr={be_wr:.1%}] "
-              f"gap={gaps}% > thuận={[round(w,3) for w in thuan_wrs]} → THEO BẺ = {dominant_pred} "
+        print(f"[ENSEMBLE] {group} → 🔱 BẺ ĐỘC TÔN [{be_name} eff_wr={be_wr:.1%}] "
+              f"gap={gaps}% > thuận={[round(w*100,1) for w in thuan_wrs]}% → THEO BẺ = {dominant_pred} "
               f"(bỏ majority={majority})")
         return dominant_pred, group, False, 1.0
 
-    # CASE 5 — BẺ ĐỘC TÔN YẾU: WR bẻ chưa hơn đủ 15% so với tất cả logic thuần → THIỂU SỐ
-    minority_pred = _minority_vote(active_preds, majority)
+    # CASE 5 — BẺ ĐỘC TÔN YẾU: WR bẻ bằng hoặc thấp hơn ≥1 logic thuần → THEO ĐA SỐ
+    # Không dùng thiểu số — tránh tình huống cả 3 vote XIU mà bẻ lại ra TAI
     tai_c = active_preds.count('TAI')
     xiu_c = active_preds.count('XIU')
     vote_str = f"{max(tai_c,xiu_c)}-{min(tai_c,xiu_c)}"
     if be_wr is not None and thuan_wrs:
         gaps = [round((be_wr - tw) * 100, 1) for tw in thuan_wrs]
-        wr_tag = f"[{be_name} eff_wr={be_wr:.1%} gap={gaps}% <15%]"
+        wr_tag = f"[{be_name} eff_wr={be_wr:.1%} gap={gaps}% — không đủ]"
     else:
-        wr_tag = f"[{be_name}]"
+        wr_tag = f"[{be_name} — không đủ dữ liệu]"
     print(f"[ENSEMBLE] {group} → 🔻 BẺ ĐỘC TÔN YẾU {wr_tag} → "
-          f"vote={vote_str} majority={majority} → THIỂU SỐ = {minority_pred}")
-    return minority_pred, group, False, 1.0
+          f"vote={vote_str} majority={majority} → THEO ĐA SỐ = {majority}")
+    return majority, group, False, 1.0
 
 
 def update_cross_comp(sess_id, case_type, actual_result, pred_made):
@@ -2543,13 +2513,29 @@ async def tg_poll_loop():
                             else:
                                 pend['double_on_loss'] = False
                                 pend['reset_on_loss']  = False
-                            pend['step'] = 'await_win_config'
+                            pend['step'] = 'await_loss_x2'
                             await tg_send(chat_id,
-                                f'Khi <b>THẮNG</b>, bạn muốn:\n'
-                                f'1️⃣ X2 tiền cược\n'
-                                f'2️⃣ Giữ nguyên số tiền cược\n'
-                                f'3️⃣ Reset về mức ban đầu\n'
-                                f'Nhập số lựa chọn (1/2/3):')
+                                f'📈 <b>X2 cược sau chuỗi thua liên tiếp?</b>\n'
+                                f'Thua bao nhiêu ván liên tiếp thì x2 cược <b>một lần</b>?\n'
+                                f'Ví dụ: nhập <b>3</b> → thua 3 ván liên tiếp → cược gốc x2 (giữ nguyên mức đó, không x2 thêm)\n'
+                                f'Thắng trở lại → reset về cược gốc.\n'
+                                f'<i>(Nhập 0 nếu không dùng tính năng này)</i>')
+                            continue
+
+                        elif step == 'await_loss_x2':
+                            try:
+                                lx2 = int(raw_txt.strip())
+                                if lx2 < 0: raise ValueError
+                                pend['loss_x2_streak'] = lx2
+                                pend['step'] = 'await_win_config'
+                                await tg_send(chat_id,
+                                    f'Khi <b>THẮNG</b>, bạn muốn:\n'
+                                    f'1️⃣ X2 tiền cược\n'
+                                    f'2️⃣ Giữ nguyên số tiền cược\n'
+                                    f'3️⃣ Reset về mức ban đầu\n'
+                                    f'Nhập số lựa chọn (1/2/3):')
+                            except ValueError:
+                                await tg_send(chat_id, '⚠️ Nhập số nguyên ≥ 0. Nhập 0 để bỏ qua.')
                             continue
 
                         elif step == 'await_win_config':
@@ -2687,6 +2673,7 @@ async def tg_poll_loop():
                                     profit_target       = pt,
                                     loss_streak_reduce  = pend.get('loss_streak_reduce', 0),
                                     reduced_bet         = pend.get('reduced_bet', 0),
+                                    loss_x2_streak      = pend.get('loss_x2_streak', 0),
                                 )
                                 _auto_bet_sessions[chat_id] = sess
                                 del _auto_bet_pending[chat_id]
@@ -2707,6 +2694,7 @@ async def tg_poll_loop():
                                 _wx2  = pend.get('win_streak_x2', 0)
                                 _lsr  = pend.get('loss_streak_reduce', 0)
                                 _rb   = pend.get('reduced_bet', 0)
+                                _lx2  = pend.get('loss_x2_streak', 0)
                                 mode_loss = ("x2 Martingale" if pend.get('double_on_loss')
                                              else ("Reset về gốc" if pend.get('reset_on_loss')
                                              else "Giữ nguyên"))
@@ -2722,6 +2710,8 @@ async def tg_poll_loop():
                                 pt_txt   = f"{pt:,}" if pt > 0 else "Không giới hạn"
                                 lr_txt   = (f"Sau {_lsr} ván thua liên tiếp → giảm xuống {_rb:,}"
                                             if _lsr > 0 else "Không giảm cược")
+                                lx2_txt  = (f"Sau {_lx2} ván thua liên tiếp → x2 một lần (giữ nguyên mức đó, thắng reset về gốc)"
+                                            if _lx2 > 0 else "Không dùng")
                                 await tg_send(chat_id,
                                     f'✅ <b>Auto-cược đã khởi động!</b>\n'
                                     f'━━━━━━━━━━━━━━\n'
@@ -2730,6 +2720,7 @@ async def tg_poll_loop():
                                     f'🎲 Cược/ván: <b>{pend["bet_amount"]:,}</b>\n'
                                     f'🟢 Thắng → {mode_win}\n'
                                     f'🔴 Thua → {mode_loss}\n'
+                                    f'📈 X2 theo chuỗi thua: {lx2_txt}\n'
                                     f'🔻 Giảm cược: {lr_txt}\n'
                                     f'🚨 Pause khi thua liên tiếp: {ls_txt}\n'
                                     f'▶️ Resume khi thắng: {ws_txt}\n'
@@ -3093,22 +3084,20 @@ async def tg_poll_loop():
                                 '  • Reset active logics → re-tune từ history thật\n'
                                 '  • Reset session offset tuner\n'
                                 '  • Reset adaptive TT1/TT2\n'
-                                '  • KHÔNG đổi ttoan\n'
-                                '  ⚠️ User thường không thấy 2 lệnh này')
+                                '  • KHÔNG đổi ttoan\n\n'
+                                '/tinhchinh &lt;số ván&gt; — Tinh chỉnh chuỗi thua đổi ttoan\n'
+                                '  • VD: /tinhchinh 5 → thua 5 ván liên tiếp mới đổi ttoan khẩn\n'
+                                '  • Mặc định: 3 ván (TTOAN_CONSEC_LOSS_BAIL)\n'
+                                '  • Reset chuỗi thua hiện tại khi đổi\n'
+                                '  ⚠️ User thường không thấy 3 lệnh này')
 
                         # ── /reloadlogic — CHỈ ép đổi ttoan ngay lập tức ──────────────
                         # (giống khi sai 3 lần liên tiếp, KHÔNG clear rolling history)
                         elif cmd == '/reloadlogic':
-                            # ── Tune logic từ window hiện tại trước khi reset ──────────
-                            # (giống emergency bail: tune → rồi mới reset bộ đếm)
-                            vans_done = _ttoan_tracker['vans_since_swap']
-                            if vans_done > 0:
-                                _run_logic_tune_with_window(vans_done)
-                            else:
-                                # Chưa có ván nào kể từ lần đổi trước → tune từ full window
-                                _run_logic_tune()
+                            # ── Reset TTOAN tracker + đổi ttoan ngay ──────────────────
+                            old_top3_rl = _logic_tuner.get('active_logics', [])[:]
+                            old_rev_rl  = list(_logic_tuner.get('reversed_logics', set()))
 
-                            # ── Reset TTOAN tracker ────────────────────────────────────
                             _ttoan_tracker['vans_since_swap']      = 0
                             _ttoan_tracker['history_since_swap']   = []
                             _ttoan_tracker['pre_trim_count']       = 0
@@ -3116,7 +3105,10 @@ async def tg_poll_loop():
                             _ttoan_tracker['last_swap_at_live']    = app_state['live_count']
                             _ttoan_tracker['swap_count']          += 1
                             _ttoan_tracker['last_swap_reason']     = 'manual_reload'
-                            _logic_tuner['since_tune']             = 0
+
+                            # ── Force re-tune logic: chọn lại top-3 từ WR hiện tại ────
+                            # Đảm bảo logic WR cao hơn trong bảng sẽ được chọn ngay
+                            _run_logic_tune()
 
                             swap_no  = _ttoan_tracker['swap_count']
                             cur_top3 = _logic_tuner.get('active_logics', [])
@@ -3124,34 +3116,26 @@ async def tg_poll_loop():
                             top3_str = ' · '.join(f'<code>{l}</code>' for l in cur_top3)
                             rev_str  = (', '.join(f'<code>{l}</code>' for l in cur_rev)
                                         if cur_rev else '—')
+                            old_top3_str = ' · '.join(f'<code>{l}</code>' for l in old_top3_rl)
+
+                            changed_tag = '✅ Đã đổi top-3' if cur_top3 != old_top3_rl else '↩️ Top-3 giữ nguyên (đã là tốt nhất)'
 
                             print(f"[RELOADLOGIC] Admin ép đổi ttoan #{swap_no} "
                                   f"@ live#{app_state['live_count']} "
-                                  f"(tune từ {vans_done} ván, rolling history GIỮ NGUYÊN)")
-
-                            # Build WR lines từ bench mới nhất
-                            _rl_bench   = _logic_tuner.get('last_bench') or {}
-                            _rl_eff_wr  = _rl_bench.get('eff_wr', {})
-                            _rl_wr_lines = []
-                            for _n in cur_top3:
-                                _eff = _rl_eff_wr.get(_n)
-                                _rev_tag = ' 🔄[BẺ]' if _n in (cur_rev or []) else ''
-                                _rl_wr_lines.append(
-                                    f'  {_n}: <b>{_eff:.1f}%</b>{_rev_tag}' if _eff else f'  {_n}: —'
-                                )
+                                  f"| logic: {old_top3_rl} → {cur_top3}")
 
                             await tg_send(chat_id,
                                 f'🔀 <b>RELOAD TTOAN — Hoàn tất</b>\n'
                                 f'━━━━━━━━━━━━━━\n'
                                 f'✅ Đã ép đổi ttoan ngay lập tức:\n'
-                                f'  • Tune logic từ {vans_done} ván gần nhất\n'
                                 f'  • TTOAN tracker reset (lần đổi #{swap_no})\n'
                                 f'  • Chuỗi sai liên tiếp xóa sạch\n'
                                 f'  • vans_since_swap, history_since_swap reset về 0\n\n'
-                                f'🧠 <b>Logic mới (re-tune từ {vans_done} ván):</b>\n'
-                                f'  Top-3: {top3_str}\n'
-                                + ('\n'.join(_rl_wr_lines) + '\n' if _rl_wr_lines else '')
-                                + f'  BẺ chiều: {rev_str}\n'
+                                f'🔁 <b>Re-tune Logic (từ WR hiện tại):</b>\n'
+                                f'  Cũ: {old_top3_str}\n'
+                                f'  Mới: {top3_str}\n'
+                                f'  BẺ chiều: {rev_str}\n'
+                                f'  {changed_tag}\n'
                                 f'━━━━━━━━━━━━━━\n'
                                 f'⚡ Ttoan mới có hiệu lực từ phiên kế tiếp.\n'
                                 f'💡 Dùng /clearlogic để clear rolling history 9 logic.\n'
@@ -3251,6 +3235,85 @@ async def tg_poll_loop():
                                 f'━━━━━━━━━━━━━━\n'
                                 f'💡 Dùng /reloadlogic để ép đổi ttoan.\n'
                                 f'<i>(Lệnh này chỉ admin thấy)</i>')
+
+                        # ── /tinhchinh — Tinh chỉnh số ván thua liên tiếp đổi ttoan ──
+                        elif cmd == '/tinhchinh':
+                            global TTOAN_CONSEC_LOSS_BAIL, BE_DOMINANT_MIN_GAP
+                            # ── Không có arg → hiện menu ─────────────────────────────
+                            if len(parts) < 2:
+                                gap_pct = round(BE_DOMINANT_MIN_GAP * 100, 1)
+                                await tg_send(chat_id,
+                                    f'⚙️ <b>TINH CHỈNH — Các thông số</b>\n'
+                                    f'━━━━━━━━━━━━━━\n'
+                                    f'1️⃣ <b>Chuỗi thua đổi ttoan:</b> <code>{TTOAN_CONSEC_LOSS_BAIL}</code> ván\n'
+                                    f'   Dùng: <code>/tinhchinh &lt;số&gt;</code>\n'
+                                    f'   VD: <code>/tinhchinh 5</code>\n\n'
+                                    f'2️⃣ <b>Gap bẻ độc tôn:</b> <code>{gap_pct}%</code>\n'
+                                    f'   WR bẻ phải hơn logic thuần ít nhất gap này mới kích hoạt bẻ\n'
+                                    f'   0% = chỉ cần strictly cao hơn | 10% = phải hơn ≥10%\n'
+                                    f'   Dùng: <code>/tinhchinh gap &lt;số&gt;</code>\n'
+                                    f'   VD: <code>/tinhchinh gap 10</code> hoặc <code>/tinhchinh gap 0</code>\n'
+                                    f'<i>(Lệnh này chỉ admin thấy)</i>')
+                                continue
+
+                            # ── /tinhchinh gap <số> → đổi BE_DOMINANT_MIN_GAP ─────────
+                            if parts[1].lower() == 'gap':
+                                if len(parts) < 3:
+                                    gap_pct = round(BE_DOMINANT_MIN_GAP * 100, 1)
+                                    await tg_send(chat_id,
+                                        f'⚙️ Gap bẻ độc tôn hiện tại: <b>{gap_pct}%</b>\n'
+                                        f'Dùng: <code>/tinhchinh gap &lt;số%&gt;</code>\n'
+                                        f'VD: <code>/tinhchinh gap 10</code> → gap 10%\n'
+                                        f'    <code>/tinhchinh gap 0</code>  → chỉ cần strictly cao hơn')
+                                    continue
+                                try:
+                                    new_gap_pct = float(parts[2])
+                                    if new_gap_pct < 0 or new_gap_pct > 50:
+                                        await tg_send(chat_id, '⚠️ Gap phải trong khoảng 0–50 (%).')
+                                        continue
+                                    old_gap_pct = round(BE_DOMINANT_MIN_GAP * 100, 1)
+                                    BE_DOMINANT_MIN_GAP = new_gap_pct / 100.0
+                                    print(f"[TINHCHINH] Admin đổi BE_DOMINANT_MIN_GAP: {old_gap_pct}% → {new_gap_pct}% "
+                                          f"@ live#{app_state['live_count']}")
+                                    await tg_send(chat_id,
+                                        f'✅ <b>TINH CHỈNH GAP — Hoàn tất</b>\n'
+                                        f'━━━━━━━━━━━━━━\n'
+                                        f'Gap bẻ độc tôn:\n'
+                                        f'  Cũ: <b>{old_gap_pct}%</b>\n'
+                                        f'  Mới: <b>{new_gap_pct}%</b>\n\n'
+                                        f'⚡ Hiệu lực từ phiên kế tiếp.\n'
+                                        f'Bẻ độc tôn chỉ kích hoạt khi WR bẻ hơn logic thuần ≥<b>{new_gap_pct}%</b>\n'
+                                        f'<i>(Lệnh này chỉ admin thấy)</i>')
+                                except ValueError:
+                                    await tg_send(chat_id, '⚠️ Nhập số. VD: /tinhchinh gap 10')
+                                continue
+
+                            # ── /tinhchinh <số> → đổi TTOAN_CONSEC_LOSS_BAIL ──────────
+                            try:
+                                new_val = int(parts[1])
+                                if new_val < 1:
+                                    await tg_send(chat_id, '⚠️ Giá trị tối thiểu là 1.')
+                                    continue
+                                old_val = TTOAN_CONSEC_LOSS_BAIL
+                                TTOAN_CONSEC_LOSS_BAIL = new_val
+                                _ttoan_tracker['real_vans_since_swap'] = 0
+                                _ttoan_tracker['history_since_swap']   = []
+                                _ttoan_tracker['vans_since_swap']      = 0
+                                _ttoan_tracker['pre_trim_count']       = 0
+                                print(f"[TINHCHINH] Admin đổi TTOAN_CONSEC_LOSS_BAIL: {old_val} → {new_val} "
+                                      f"@ live#{app_state['live_count']}")
+                                await tg_send(chat_id,
+                                    f'✅ <b>TINH CHỈNH — Hoàn tất</b>\n'
+                                    f'━━━━━━━━━━━━━━\n'
+                                    f'Chuỗi thua đổi ttoan:\n'
+                                    f'  Cũ: <b>{old_val}</b> ván\n'
+                                    f'  Mới: <b>{new_val}</b> ván\n\n'
+                                    f'⚡ Chuỗi thua hiện tại đã reset về 0.\n'
+                                    f'Tool sẽ đổi ttoan khẩn sau <b>{new_val}</b> ván thua liên tiếp.\n'
+                                    f'<i>(Lệnh này chỉ admin thấy)</i>')
+                            except ValueError:
+                                await tg_send(chat_id, '⚠️ Nhập số nguyên dương. VD: /tinhchinh 5')
+                            continue
 
                         else:
                             # admin dùng lệnh user bình thường
@@ -6325,7 +6388,7 @@ if __name__ == '__main__':
     print("  [NO CROSS-COMP] Luôn THEO majority — không bù trừ lô chéo")
     print(f"  http://localhost:{PORT}")
     print(f"  History file : history.json (lưu không giới hạn)")
-    print(f"  Logic: L1–L12 | Top-3 auto-tune theo WR | Warmup {WARMUP_COUNT} phiên (1 lần)")
+    print(f"  Logic: L1–L16 | Top-3 auto-tune theo WR | Warmup {WARMUP_COUNT} phiên (1 lần)")
     print(f"  TTOAN: giữ WR≥60% | đổi WR<40% + trim từ ván sai gần nhất")
     print(f"  Session Tuner offset auto | Majority follow")
     print(f"  Telegram Bot : /tool (dự đoán) | /autobet (auto-cược) | /stop /stopbet")
