@@ -181,6 +181,74 @@ async def lc79_auto_login(username: str, password: str) -> tuple:
     return jwt, balance, nick
 
 
+async def lc79_fetch_balance(jwt: str) -> int | None:
+    """
+    v34: Gọi API lấy balance thực tế từ server LC79 dùng JWT hiện tại.
+    Trả int balance nếu thành công, None nếu JWT hết hạn / lỗi.
+    Endpoint: GET https://wlb.tele68.com/v1/lobby/user/info (Authorization: Bearer <jwt>)
+    Fallback: POST /v1/lobby/auth/refresh nếu endpoint info không trả money.
+    """
+    if not jwt:
+        return None
+    headers = {
+        **LOGIN_HEADERS_LC,
+        "Authorization": f"Bearer {jwt}",
+    }
+    timeout = aiohttp.ClientTimeout(total=10)
+    # Thử endpoint user info trước
+    try:
+        async with aiohttp.ClientSession(headers=headers) as sess:
+            async with sess.get(
+                "https://wlb.tele68.com/v1/lobby/user/info",
+                params={"cp": "R", "cl": "R", "pf": "web"},
+                timeout=timeout,
+            ) as r:
+                if r.status == 200:
+                    data = await r.json(content_type=None)
+                    # Server có thể trả money ở nhiều field
+                    money = (
+                        data.get("money")
+                        or data.get("balance")
+                        or (data.get("data") or {}).get("money")
+                        or (data.get("data") or {}).get("balance")
+                        or (data.get("remoteLoginResp") or {}).get("money")
+                    )
+                    if money is not None:
+                        print(f"[LC79-BAL] ✅ balance={int(money):,} (user/info)")
+                        return int(money)
+                elif r.status in (401, 403):
+                    print(f"[LC79-BAL] JWT hết hạn (status={r.status})")
+                    return None
+    except Exception as e:
+        print(f"[LC79-BAL] user/info lỗi: {e}")
+
+    # Fallback: thử endpoint wallet/balance
+    try:
+        async with aiohttp.ClientSession(headers=headers) as sess:
+            async with sess.get(
+                "https://wlb.tele68.com/v1/lobby/wallet/balance",
+                params={"cp": "R", "cl": "R", "pf": "web"},
+                timeout=timeout,
+            ) as r:
+                if r.status == 200:
+                    data = await r.json(content_type=None)
+                    money = (
+                        data.get("money")
+                        or data.get("balance")
+                        or (data.get("data") or {}).get("money")
+                        or (data.get("data") or {}).get("balance")
+                    )
+                    if money is not None:
+                        print(f"[LC79-BAL] ✅ balance={int(money):,} (wallet/balance)")
+                        return int(money)
+                elif r.status in (401, 403):
+                    return None
+    except Exception as e:
+        print(f"[LC79-BAL] wallet/balance lỗi: {e}")
+
+    return None
+
+
 async def lc79_place_bet_ws(ws, side: str, amount: int) -> bool:
     """
     v28: Đặt cược qua WebSocket đang kết nối — cùng kết nối với bàn MD5.
@@ -274,9 +342,13 @@ class AutoBetSession:
         loss_streak_reduce: int = 0,  # v31: thua N ván liên tiếp → giảm cược (0=không)
         reduced_bet: int = 0,         # v31: mức cược giảm xuống khi đủ loss_streak_reduce
         loss_x2_streak: int = 0,      # v32+: thua N ván liên tiếp → x2 cược (0=không)
+        username: str = '',           # v34: lưu để re-login + fetch balance thực tế
+        password: str = '',           # v34
     ):
         self.chat_id            = chat_id
         self.jwt                = jwt
+        self.username           = username    # v34
+        self.password           = password    # v34
         self.ledger             = ledger
         self.base_bet           = base_bet
         self.current_bet        = base_bet
@@ -300,6 +372,9 @@ class AutoBetSession:
         self.pending_entry      = None
         self._is_reduced        = False  # v31: đang ở chế độ cược giảm
         self._loss_x2_triggered = False  # v32+: đang trong chuỗi x2 do thua liên tiếp
+        # v34: balance sync
+        self._bal_sync_fail     = 0      # lần fetch thất bại liên tiếp
+        self._relogin_lock      = False  # tránh re-login đồng thời
 
     def on_win(self):
         self.win_streak  += 1
@@ -491,7 +566,8 @@ app_state = {
     'sessions':     {},
     'history':      [],
     'results':      [],
-    'current_pred': None,
+    'current_pred':  None,
+    'pending_preds': {},   # v33 FIX: { sess_id: pred_result } — lưu nhiều phiên tránh bị overwrite
     'sse_clients':  set(),
     'stats':        {'total': 0, 'tai': 0, 'xiu': 0, 'hoa': 0},
     'live_count':   0,   # số phiên live đã tích từ lúc khởi động (reset mỗi lần chạy)
@@ -2472,10 +2548,11 @@ async def tg_poll_loop():
                                     'Thử lại: /autobet')
                                 del _auto_bet_pending[chat_id]
                                 continue
-                            pend['jwt']     = jwt
-                            pend['balance'] = balance
-                            pend['nick']    = nick
-                            pend['step']    = 'await_bet_amount'
+                            pend['jwt']           = jwt
+                            pend['balance']       = balance
+                            pend['nick']          = nick
+                            pend['password_plain'] = password  # v34: store for balance sync re-login
+                            pend['step']          = 'await_bet_amount'
                             await tg_send(chat_id,
                                 f'✅ <b>Đăng nhập thành công!</b>\n'
                                 f'Tài khoản: <b>{nick}</b>\n'
@@ -2674,6 +2751,8 @@ async def tg_poll_loop():
                                     loss_streak_reduce  = pend.get('loss_streak_reduce', 0),
                                     reduced_bet         = pend.get('reduced_bet', 0),
                                     loss_x2_streak      = pend.get('loss_x2_streak', 0),
+                                    username            = pend.get('username', ''),   # v34
+                                    password            = pend.get('password_plain', ''),  # v34
                                 )
                                 _auto_bet_sessions[chat_id] = sess
                                 del _auto_bet_pending[chat_id]
@@ -3835,6 +3914,78 @@ async def handle_tick_update(data):
             f'Cược: <b>{_ab_sess.current_bet:,}</b> | Bal: <b>{_ab_sess.ledger.balance:,}</b>')
 
 
+
+# ─── AutoBet v34: Balance Sync ────────────────────────────────────────────────
+async def _ab_sync_balance(ab_sess: 'AutoBetSession', chat_id: int, sess_id: str):
+    """
+    v34: Gọi sau mỗi phiên resolve — fetch balance thực từ server, sync vào ledger.
+    - Nếu JWT hết hạn → tự re-login (dùng username/password đã lưu) → cập nhật jwt
+    - Nếu lệch balance → sync + thông báo Telegram
+    - Nếu fetch liên tiếp thất bại 3 lần → thông báo warning nhưng không dừng tool
+    """
+    if ab_sess._relogin_lock:
+        return  # đang re-login ở coroutine khác, bỏ qua lần này
+
+    real_bal = await lc79_fetch_balance(ab_sess.jwt)
+
+    # JWT hết hạn → thử re-login
+    if real_bal is None and ab_sess.username and ab_sess.password:
+        ab_sess._relogin_lock = True
+        try:
+            print(f"[BAL-SYNC] JWT hết hạn cho {chat_id} — đang re-login...")
+            new_jwt, new_bal, nick = await lc79_auto_login(ab_sess.username, ab_sess.password)
+            if new_jwt:
+                ab_sess.jwt = new_jwt
+                real_bal    = new_bal if new_bal else await lc79_fetch_balance(new_jwt)
+                msg_relogin = (
+                    f'🔄 <b>Tự động làm mới phiên đăng nhập</b>\n'
+                    f'JWT hết hạn — đã đăng nhập lại thành công.\n'
+                    f'Số dư thực: <b>{real_bal:,}</b> CHS'
+                ) if real_bal else '🔄 Đăng nhập lại thành công.'
+                await tg_send(chat_id, msg_relogin)
+                ab_sess._bal_sync_fail = 0
+            else:
+                ab_sess._bal_sync_fail += 1
+                if ab_sess._bal_sync_fail >= 3:
+                    await tg_send(chat_id,
+                        f'⚠️ <b>Cảnh báo balance sync</b>\n'
+                        f'Không thể lấy số dư thực ({ab_sess._bal_sync_fail} lần).\n'
+                        f'Đang dùng số dư ước tính: <b>{ab_sess.ledger.balance:,}</b>')
+        finally:
+            ab_sess._relogin_lock = False
+
+    if real_bal is None:
+        ab_sess._bal_sync_fail += 1
+        return  # không có gì để sync
+
+    ab_sess._bal_sync_fail = 0
+    ledger_bal = ab_sess.ledger.balance
+
+    # Tính độ lệch — bỏ qua nếu chênh nhỏ hơn 1% và dưới 500 CHS (noise)
+    diff = real_bal - ledger_bal
+    abs_diff = abs(diff)
+    rel_diff = abs_diff / max(ledger_bal, 1)
+
+    print(f"[BAL-SYNC] Phiên #{sess_id} | ledger={ledger_bal:,} real={real_bal:,} diff={diff:+,}")
+
+    if abs_diff > 0:
+        sign = "+" if diff > 0 else ""
+        # Sync ledger về số dư thực
+        ab_sess.ledger.balance = real_bal
+
+        if abs_diff >= 500 or rel_diff >= 0.01:
+            # Lệch đáng kể → thông báo
+            await tg_send(chat_id,
+                f'🔄 <b>Đồng bộ số dư — Phiên #{sess_id}</b>\n'
+                f'━━━━━━━━━━━━━━\n'
+                f'Số dư tool tính: <b>{ledger_bal:,}</b>\n'
+                f'Số dư thực tế : <b>{real_bal:,}</b>\n'
+                f'Chênh lệch    : <b>{sign}{diff:,}</b> CHS\n'
+                f'<i>Đã tự động đồng bộ.</i>')
+        else:
+            # Lệch nhỏ (rounding, phí) → sync im lặng, chỉ log
+            pass
+
 async def handle_new_session(data):
     """
     Event: 42/txmd5,["new-session", {id: 6986062, duration: 50000, md5: "9c902be..."}]
@@ -3981,6 +4132,12 @@ async def handle_new_session(data):
         'be_mode':          _be_mode,            # 'dominant_strong'|'dominant_weak'|'two_be'|'full_be'|None
     }
     app_state['current_pred'] = {'sess': sid, 'md5': md5h, 'pred': pred_result}
+    # v33 FIX: lưu thêm vào pending_preds — tránh bị overwrite khi new-session tới trước session-result
+    app_state['pending_preds'][sid] = pred_result
+    # Giữ tối đa 20 phiên gần nhất để không tràn RAM
+    if len(app_state['pending_preds']) > 20:
+        oldest_key = next(iter(app_state['pending_preds']))
+        del app_state['pending_preds'][oldest_key]
 
     _mode_labels = {
         'dominant_strong': f"🔱 BẺ ĐỘC TÔN MẠNH [{_be_logic_name} {_be_logic_wr}%]",
@@ -4100,12 +4257,21 @@ async def handle_session_result(data):
                 )
 
     # Kiểm tra dự đoán đúng/sai
+    # v33 FIX: ưu tiên pending_preds[sess_id] — tránh miss khi current_pred bị overwrite bởi phiên mới
     pred_ok  = None
     pred_val = None
-    if app_state['current_pred'] and app_state['current_pred']['sess'] == sess_id:
-        cp       = app_state['current_pred']['pred']
+    _cp_data = (
+        app_state['pending_preds'].get(sess_id)          # lookup trực tiếp từ dict nhiều phiên
+        or (app_state['current_pred']['pred']
+            if app_state['current_pred'] and app_state['current_pred']['sess'] == sess_id
+            else None)
+    )
+    if _cp_data:
+        cp       = _cp_data
         pred_val = cp['ensemble']
         pred_ok  = (pred_val == result_up) if pred_val else None
+        # Dọn pending_preds sau khi đã dùng
+        app_state['pending_preds'].pop(sess_id, None)
         # v15: cross_comp no-op (removed)
         update_cross_comp(sess_id, cp.get('case_type', ''), result_up, pred_val)
         # Cập nhật correlation tracker
@@ -4311,6 +4477,9 @@ async def handle_session_result(data):
                 f'Số dư: <b>{_ab_sess.ledger.balance:,}</b> | '
                 f'{_ab_net_sign}Tổng L/L: <b>{_ab_net_sign}{_ab_net:,}</b>'
                 + _pause_hint)
+
+            # v34: Sync balance thực tế từ server sau mỗi phiên
+            asyncio.ensure_future(_ab_sync_balance(_ab_sess, _ab_cid, sess_id))
 
 
 # ─── HTTP Handlers ────────────────────────────────────────────────────────────
