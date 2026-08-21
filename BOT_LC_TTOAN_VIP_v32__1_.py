@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TX Ensemble Tool — Python Backend (v38 - Real WS AutoBet + Exponential Win + Profit Target)
+TX Ensemble Tool — Python Backend (v28 - Real WS AutoBet + Exponential Win + Profit Target)
 - Kết nối WS game: wss://wtxmd52.tele68.com/txmd5/
 - HTTP server: http://localhost:2300
 - 16 Logic Engine (L1–L16) + Session Tuner + Adaptive TT1/TT2 Grouping
@@ -11,9 +11,8 @@ TX Ensemble Tool — Python Backend (v38 - Real WS AutoBet + Exponential Win + P
   · 4 logic mới: L13/L14/L15/L16 (thêm v37)
   · WARMUP: chờ 10 phiên live trước khi bắt đầu dự đoán (chỉ chạy 1 LẦN khi bật tool)
             Sau khi đổi ttoan KHÔNG warmup lại — dự đoán tiếp ngay từ ván kế tiếp.
-  · Tune chọn 3 logic WR cao nhất (thuần) → ensemble majority từ top-3
+  · Tune chọn 3 logic mạnh nhất trong 12 → ensemble majority từ top-3
   · Tune kết hợp với session tuner offset (-1/0/+1)
-  · v38: BỎ HOÀN TOÀN logic WR bẻ — top-3 chọn theo WR cao nhất bình thường
   · BÙ TRỪ LÔ CHÉO ĐÃ XÓA — tool giờ luôn THEO majority thuần
   · Adaptive TT1/TT2 grouping vẫn còn (phân loại case, thống kê)
   · Correlation / pair tracker vẫn còn (thống kê tham khảo)
@@ -415,7 +414,7 @@ TTOAN_WR_SWAP_THRESH  = 0.40   # WR 10 ván < 40% → đổi ttoan ngay lập t�
 TTOAN_CHECK_WINDOW    = 10     # số ván gần nhất để tính WR kiểm tra
 TTOAN_CONSEC_LOSS_BAIL = 3     # v35: sai liên tiếp 3 ván thật → đổi ttoan khẩn (không cần đủ window)
 HISTORY_SAVE_INTERVAL = 1    # lưu file sau mỗi phiên (persistent ngay lập tức)
-# BE_DOMINANT_MIN_GAP removed — v38 không còn dùng logic WR bẻ
+BE_DOMINANT_MIN_GAP   = 0.0  # gap tối thiểu WR bẻ phải hơn logic thuần (0.0=chỉ cần >; 0.10=>=10%; 0.15=>=15%)
 
 # ─── Telegram Config ──────────────────────────────────────────────────────────
 TG_TOKEN     = '8943843485:AAF9Lhoa6DlGidZWoy8Ok_-fd5qWqau4bSs'
@@ -1342,19 +1341,21 @@ def _run_logic_L16(X, md5h):
     K = int(min(inner, z_div))
     return 'TAI' if K % 2 == 0 else 'XIU'
 
-# ─── v38: Logic Tuner — chọn top-3 theo WR cao nhất (không bẻ) ──────────────
-# Sau WARMUP_COUNT phiên, mỗi lần ttoan đổi:
-#   → đánh giá WR của từng logic (L1–L16) trên rolling window 30 phiên gần nhất
-#   → chọn 3 logic có WR cao nhất → ensemble majority từ top-3
-#   → KHÔNG đảo chiều (bẻ) bất kỳ logic nào
-# Mặc định ban đầu: dùng L1+L2+L3
-# Pool: L1–L16 (v37+)
+# ─── v32: Logic Tuner — chọn top-3 trong 9 logic + BẺ CHIỀU khi reversed WR cao hơn ──
+# Sau WARMUP_COUNT phiên, mỗi LOGIC_TUNE_INTERVAL phiên:
+#   → đánh giá WR của từng logic (L1–L9) trên rolling window 30 phiên gần nhất
+#   → tính thêm reversed WR = 1 - WR (nếu đảo chiều pred thì WR bao nhiêu?)
+#   → chọn 3 "slot" có effective WR cao nhất — có thể là normal hoặc reversed
+#   → logic bị bẻ sẽ đảo pred khi dùng trong ensemble
+# BẺ ĐK: reversed_wr > REVERSE_THRESHOLD và reversed_wr > best_normal_wr_in_top3
+# Mặc định ban đầu: dùng L1+L2+L3 (giống v15/v16)
+# v32: pool mở rộng từ 6 → 9 logic (thêm L7/L8/L9)
 LOGIC_TUNE_WINDOW    = 30    # rolling window để tính WR từng logic
-# REVERSE_THRESHOLD removed — v38 bỏ hẳn logic WR bẻ, chỉ dùng WR thuần
+REVERSE_THRESHOLD    = 0.55  # ngưỡng reversed WR tối thiểu để bẻ (tránh noise)
 
 _logic_tuner = {
-    'active_logics':   ['L1', 'L2', 'L3'],  # top-3 đang dùng (chọn theo WR cao nhất, không bẻ)
-    'reversed_logics': set(),                # giữ lại để compat UI — luôn empty ở v38
+    'active_logics':   ['L1', 'L2', 'L3'],  # top-3 đang dùng
+    'reversed_logics': set(),                # tên logic đang bị bẻ chiều
     'since_tune':    0,                    # phiên có pred kể từ lần tune cuối
     'total_preds':   0,                    # tổng phiên có pred (để biết đã qua warmup chưa)
     # Rolling history per-logic: list of bool (True=đúng, False=sai)
@@ -1645,63 +1646,213 @@ def _run_logic_tune_with_window(n_vans: int):
 
 def _apply_logic_tune(wrs: dict, reason: str = 'periodic'):
     """
-    v38: Core của logic tuner — chọn top-3 theo WR thuần cao nhất.
-    BỎ HOÀN TOÀN logic WR bẻ (reversed / flip).
+    Core của logic tuner — tính effective WR, chọn top-3, cập nhật state.
     Tách ra riêng để cả _run_logic_tune lẫn _run_logic_tune_with_window đều dùng được.
     """
-    old_top3 = _logic_tuner['active_logics'][:]
+    old_top3     = _logic_tuner['active_logics'][:]
+    old_reversed = set(_logic_tuner['reversed_logics'])
 
-    # Sort theo WR thuần giảm dần — không có bẻ, không có effective/reversed
-    ranked = sorted(
+    effective = {}
+    for name in ALL_LOGICS:
+        wr = wrs.get(name, 0.5)
+        rev_wr = 1.0 - wr
+        if rev_wr > wr and rev_wr >= REVERSE_THRESHOLD:
+            effective[name] = (rev_wr, True)
+        else:
+            effective[name] = (wr, False)
+
+    ranked_eff = sorted(
         ALL_LOGICS,
-        key=lambda n: wrs.get(n, 0.5),
+        key=lambda n: (effective[n][0], 0 if not effective[n][1] else -1),
         reverse=True
     )
 
-    new_top3 = ranked[:3]
+    new_top3 = []
+    used     = set()
+    for candidate in ranked_eff:
+        if len(new_top3) == 3:
+            break
+        if candidate in used:
+            continue
+        eff_score, is_rev = effective[candidate]
+        if is_rev:
+            best_normal_remaining = max(
+                (effective[n][0] for n in ALL_LOGICS
+                 if n not in used and n != candidate and not effective[n][1]),
+                default=0.0
+            )
+            if best_normal_remaining >= eff_score:
+                continue
+        new_top3.append(candidate)
+        used.add(candidate)
+
+    if len(new_top3) < 3:
+        for candidate in ranked_eff:
+            if candidate not in used:
+                new_top3.append(candidate)
+                used.add(candidate)
+            if len(new_top3) == 3:
+                break
+
+    new_reversed = {n for n in new_top3 if effective[n][1]}
 
     _logic_tuner['active_logics']   = new_top3
-    _logic_tuner['reversed_logics'] = set()   # luôn empty — không bẻ nữa
+    _logic_tuner['reversed_logics'] = new_reversed
 
-    bench_wr = {n: round(wrs.get(n, 0.5) * 100, 1) for n in ALL_LOGICS}
+    bench_wr     = {n: round(wrs.get(n, 0.5) * 100, 1) for n in ALL_LOGICS}
+    bench_eff_wr = {n: round(effective[n][0] * 100, 1) for n in ALL_LOGICS}
+    bench_rev_wr = {n: round((1.0 - wrs.get(n, 0.5)) * 100, 1) for n in ALL_LOGICS}
+    bench_is_rev = {n: effective[n][1] for n in ALL_LOGICS}
 
     bench = {
         'wr':       bench_wr,
-        'eff_wr':   bench_wr,          # eff_wr = wr (không bẻ)
-        'rev_wr':   {n: round((1.0 - wrs.get(n, 0.5)) * 100, 1) for n in ALL_LOGICS},
-        'is_rev':   {n: False for n in ALL_LOGICS},   # không bẻ logic nào
+        'eff_wr':   bench_eff_wr,
+        'rev_wr':   bench_rev_wr,
+        'is_rev':   bench_is_rev,
         'top3':     new_top3,
-        'reversed': [],
+        'reversed': list(new_reversed),
         'at':       app_state['live_count'],
-        'changed':  new_top3 != old_top3,
+        'changed':  new_top3 != old_top3 or new_reversed != old_reversed,
         'reason':   reason,
     }
     _logic_tuner['last_bench'] = bench
 
-    wr_str = '  '.join(f"{n}={bench_wr[n]:.1f}%" for n in ranked)
+    wr_parts = []
+    for n in ranked_eff:
+        eff_s, is_r = effective[n]
+        tag = '[BẺ]' if is_r else ''
+        wr_parts.append(f"{n}={round(eff_s*100,1):.1f}%{tag}")
+    wr_str = '  '.join(wr_parts)
 
     changed_tag = ''
-    if new_top3 != old_top3:
-        changed_tag = f"  ← CHANGED {old_top3} → {new_top3}"
+    if new_top3 != old_top3 or new_reversed != old_reversed:
+        changed_tag = f"  ← CHANGED {old_top3}(rev={list(old_reversed)}) → {new_top3}(rev={list(new_reversed)})"
     else:
         changed_tag = '  (no change)'
 
-    print(f"[LOGIC TUNER v38/{reason}] @ live#{app_state['live_count']} | "
-          f"{wr_str} | top3={new_top3}{changed_tag}")
+    print(f"[LOGIC TUNER v21/{reason}] @ live#{app_state['live_count']} | "
+          f"{wr_str} | top3={new_top3} rev={list(new_reversed)}{changed_tag}")
 
 
 def _run_logic_tune():
     """
-    v38: Chọn top-3 logic có WR cao nhất — thuần WR, không dùng WR bẻ / reversed.
+    v17+: Chọn top-3 logic có effective WR cao nhất.
+    Effective WR = max(WR, 1-WR) — nếu 1-WR thắng thì logic đó được chọn dưới dạng REVERSED.
+    Điều kiện bẻ: reversed_wr >= REVERSE_THRESHOLD (tránh noise khi WR ~50%).
+
+    Rule mới: logic bẻ chỉ được chọn vào top-3 khi effective WR của nó
+    STRICTLY CAO HƠN tất cả logic thường (không bẻ) còn lại ngoài top-3.
+    Nếu bằng hoặc thấp hơn → ưu tiên logic thường thay thế.
     """
     _logic_tuner['since_tune'] = 0
 
+    # Tính WR gốc
     wrs = {}
     for name in ALL_LOGICS:
         hist = _logic_tuner['history'][name]
-        wrs[name] = sum(hist) / len(hist) if hist else 0.5
+        if hist:
+            wrs[name] = sum(hist) / len(hist)
+        else:
+            wrs[name] = 0.5   # neutral
 
-    _apply_logic_tune(wrs, reason='periodic')
+    # Tính effective WR và quyết định reversed hay không
+    effective = {}
+    for name in ALL_LOGICS:
+        wr = wrs[name]
+        rev_wr = 1.0 - wr
+        if rev_wr > wr and rev_wr >= REVERSE_THRESHOLD:
+            effective[name] = (rev_wr, True)
+        else:
+            effective[name] = (wr, False)
+
+    # Sort theo effective WR giảm dần (ưu tiên normal khi sama via key tuple)
+    # (effective_wr DESC, is_reversed ASC) → normal logic diutamakan saat WR sama
+    ranked_eff = sorted(
+        ALL_LOGICS,
+        key=lambda n: (effective[n][0], 0 if not effective[n][1] else -1),
+        reverse=True
+    )
+
+    # Build top-3 dengan aturan: logic bẻ hanya masuk jika effective WR-nya
+    # strictly lebih tinggi dari SEMUA logic normal yang bisa jadi pengganti.
+    # Iterasi greedy: slot per slot, cek apakah kandidat (bẻ) layak.
+    old_top3     = _logic_tuner['active_logics'][:]
+    old_reversed = set(_logic_tuner['reversed_logics'])
+
+    new_top3     = []
+    used         = set()
+
+    # Pisahkan kandidat normal dan bẻ (semua masuk pool, sudah sorted)
+    for candidate in ranked_eff:
+        if len(new_top3) == 3:
+            break
+        if candidate in used:
+            continue
+
+        eff_score, is_rev = effective[candidate]
+
+        if is_rev:
+            # Logic bẻ: cek apakah ada logic normal (non-bẻ) yang belum dipakai
+            # dengan effective WR >= eff_score → jika ada, skip logic bẻ ini
+            best_normal_remaining = max(
+                (effective[n][0] for n in ALL_LOGICS
+                 if n not in used and n != candidate and not effective[n][1]),
+                default=0.0
+            )
+            if best_normal_remaining >= eff_score:
+                # Ada logic normal dengan WR >= bẻ → skip, ambil yang normal duluan
+                continue
+
+        new_top3.append(candidate)
+        used.add(candidate)
+
+    # Jika belum 3 slot terisi (jarang terjadi), isi sisa dengan logic terbaik yang tersisa
+    if len(new_top3) < 3:
+        for candidate in ranked_eff:
+            if candidate not in used:
+                new_top3.append(candidate)
+                used.add(candidate)
+            if len(new_top3) == 3:
+                break
+
+    new_reversed = {n for n in new_top3 if effective[n][1]}
+
+    _logic_tuner['active_logics']   = new_top3
+    _logic_tuner['reversed_logics'] = new_reversed
+
+    # Build bench data — lưu cả effective WR và reversed WR cho frontend
+    bench_wr      = {n: round(wrs[n] * 100, 1) for n in ALL_LOGICS}
+    bench_eff_wr  = {n: round(effective[n][0] * 100, 1) for n in ALL_LOGICS}
+    bench_rev_wr  = {n: round((1.0 - wrs[n]) * 100, 1) for n in ALL_LOGICS}
+    bench_is_rev  = {n: effective[n][1] for n in ALL_LOGICS}
+
+    bench = {
+        'wr':       bench_wr,          # WR gốc (thực tế)
+        'eff_wr':   bench_eff_wr,      # effective WR (dùng để rank)
+        'rev_wr':   bench_rev_wr,      # reversed WR (1 - wr)
+        'is_rev':   bench_is_rev,      # True nếu logic đó đang bẻ
+        'top3':     new_top3,
+        'reversed': list(new_reversed),
+        'at':       app_state['live_count'],
+        'changed':  new_top3 != old_top3 or new_reversed != old_reversed,
+    }
+    _logic_tuner['last_bench'] = bench
+
+    # Log
+    wr_parts = []
+    for n in ranked_eff:
+        eff_s, is_r = effective[n]
+        tag = '[BẺ]' if is_r else ''
+        wr_parts.append(f"{n}={round(eff_s*100,1):.1f}%{tag}")
+    wr_str = '  '.join(wr_parts)
+
+    changed_tag = ''
+    if new_top3 != old_top3 or new_reversed != old_reversed:
+        changed_tag = f"  ← CHANGED {old_top3}(rev={list(old_reversed)}) → {new_top3}(rev={list(new_reversed)})"
+    else:
+        changed_tag = '  (no change)'
+
+    print(f"[LOGIC TUNER v17] Tune @ live#{app_state['live_count']} | {wr_str} | top3={new_top3} rev={list(new_reversed)}{changed_tag}")
 
 def get_active_logics() -> list[str]:
     """Trả về top-3 logic đang active."""
@@ -1713,26 +1864,78 @@ def get_reversed_logics() -> set:
 
 def run_three_logic(sess_str, md5h):
     """
-    v38: Tính cả 16 logic, chọn top-3 active từ logic tuner (WR cao nhất),
-    ensemble majority từ top-3 — raw pred, không bẻ, không flip.
+    v16+: Tính cả 6 logic, chọn top-3 active từ logic tuner, ensemble majority từ top-3.
+    Phân loại 4 case dựa trên top-3 logic đang active → 2 nhóm TT1/TT2.
     sess_str đã là sess+1 (được +1 trước khi gọi hàm này).
+
+    Rule bẻ có điều kiện:
+    Nếu top-3 có logic bẻ VÀ WR logic bẻ KHÔNG phải cao nhất trong top-3:
+      - Nếu 2 logic normal đồng thuận nhau MÀ logic bẻ vote khác → đảo pred sang 2 normal thắng
+      - Nếu logic bẻ đồng thuận với ít nhất 1 normal → majority bình thường (bẻ vẫn đóng góp)
+    Nếu logic bẻ có WR cao nhất trong top-3 → bẻ hoạt động bình thường, không hạn chế.
     """
     X, Y, Z = _calc_XYZ(sess_str, md5h)
 
+    # Tính cả 9 logic (v32: thêm L7/L8/L9)
     all_preds = {name: _run_one_logic(name, X, Y, Z, md5h) for name in ALL_LOGICS}
     l1 = all_preds['L1']
     l2 = all_preds['L2']
     l3 = all_preds['L3']
 
-    # Lấy top-3 active từ logic tuner (chọn theo WR cao nhất, không bẻ)
-    active    = get_active_logics()
-    reversed_ = get_reversed_logics()   # luôn empty ở v38 — giữ để compat
+    # Lấy top-3 active từ logic tuner
+    active    = get_active_logics()    # e.g. ['L1', 'L3', 'L5']
+    reversed_ = get_reversed_logics()  # set logic đang bẻ chiều
 
-    # Raw pred — không flip bất kỳ logic nào
-    active_preds = [all_preds[n] for n in active]
+    def _flip(v):
+        return 'XIU' if v == 'TAI' else 'TAI'
 
-    # effective_preds = raw pred (không bẻ)
-    effective_preds = dict(all_preds)
+    # Lấy effective WR từ last_bench để biết ai WR cao nhất trong top-3
+    bench = _logic_tuner.get('last_bench') or {}
+    eff_wr_map = bench.get('eff_wr', {})   # { 'L1': float%, 'L3': float%, ... }
+
+    # ── Bẻ độc tôn — rule áp dụng khi ensemble ──────────────────────────────────
+    # reversed_ có thể chứa 0, 1, 2, hoặc 3 logic (tuner giữ nguyên, không trim).
+    # Rule:
+    #   - 0 bẻ trong top-3          → chạy raw pred toàn bộ, không flip gì
+    #   - 2+ bẻ trong top-3         → bỏ qua tất cả bẻ, chạy raw pred toàn bộ
+    #   - Đúng 1 bẻ trong top-3     → chỉ áp bẻ khi nó là WR cao nhất trong top-3
+    #                                  (bẻ độc tôn); nếu không phải WR cao nhất → cũng bỏ
+    reversed_in_top3 = [n for n in active if n in reversed_]
+    n_bẻ = len(reversed_in_top3)
+
+    apply_flip: set = set()   # set tên logic thực sự được flip trong lần này
+
+    if n_bẻ == 1:
+        bẻ_name = reversed_in_top3[0]
+        top3_wr = {n: eff_wr_map.get(n, 0.0) for n in active}
+        max_wr  = max(top3_wr.values()) if top3_wr else 0.0
+        if top3_wr.get(bẻ_name, 0.0) > max_wr:
+            # Bẻ độc tôn — WR STRICTLY cao hơn tất cả → flip
+            apply_flip = {bẻ_name}
+            print(f"[BẺ ĐỘC TÔN] {bẻ_name} WR={top3_wr[bẻ_name]:.1f}% cao hơn hết → flip")
+        else:
+            # Bằng hoặc thấp hơn → không flip, theo raw (majority)
+            print(f"[BẺ BỎ QUA] {bẻ_name} WR={top3_wr.get(bẻ_name,0):.1f}% bằng/thấp hơn "
+                  f"(max={max_wr:.1f}%) → theo đa số raw")
+    elif n_bẻ >= 2:
+        print(f"[BẺ BỎ QUA] {n_bẻ} logic bẻ trong top-3 {reversed_in_top3} → chạy raw toàn bộ")
+    # n_bẻ == 0: không làm gì, apply_flip rỗng
+
+    active_preds = []
+    for n in active:
+        pred = all_preds[n]
+        if n in apply_flip:
+            pred = _flip(pred)
+        active_preds.append(pred)
+
+    # Build effective_preds dict để trả về (giá trị sau khi bẻ + guard)
+    effective_preds = {}
+    for i, n in enumerate(active):
+        effective_preds[n] = active_preds[i]
+    # Logics ngoài top-3: effective = raw pred mereka (no flip)
+    for n in ALL_LOGICS:
+        if n not in effective_preds:
+            effective_preds[n] = _flip(all_preds[n]) if n in reversed_ else all_preds[n]
 
     tai_count = active_preds.count('TAI')
     xiu_count = active_preds.count('XIU')
@@ -1763,16 +1966,17 @@ def run_three_logic(sess_str, md5h):
     group = get_case_group(case_type)
 
     return {
-        # Top-3 active — raw pred (không bẻ)
+        # Top-3 active — dùng effective pred (đã bẻ nếu reversed)
         'L1': active_preds[0],
         'L2': active_preds[1],
         'L3': active_preds[2],
         # Tên logic thực tế đang được dùng
         'active_logics':   active,
-        # v38: không bẻ → luôn empty
-        'reversed_logics': [],
-        # Toàn bộ logic — raw pred
-        'all_preds':       all_preds,
+        # Logic đang bị bẻ chiều trong top-3
+        'reversed_logics': list(reversed_),
+        # Toàn bộ 6 logic — raw pred (chưa bẻ)
+        'all_preds': all_preds,
+        # Toàn bộ 6 logic — effective pred (đã bẻ nếu reversed)
         'effective_preds': effective_preds,
         'X': X, 'Y': Y, 'Z': Z,
         'tai_count': tai_count,
@@ -1997,34 +2201,153 @@ def update_corr_tracker(case_type, l1, l2, l3, majority, ensemble, actual):
 
 def get_ensemble_cross_comp(logic_result):
     """
-    v38 — Bỏ hoàn toàn logic WR bẻ.
-    Top-3 chọn theo WR cao nhất (thuần), ensemble = majority + rev_ns + flip như cũ.
-    reversed_logics luôn rỗng → không có case bẻ nào được kích hoạt.
+    v20 — Logic ưu tiên (theo thứ tự):
+
+    1. TOP-3 FULL BẺ (3 logic bẻ) → theo bình thường (majority), không áp thiểu số.
+
+    2. TOP-3 CÓ 2 LOGIC BẺ:
+       2a. 2 logic bẻ ĐỒNG THUẬN nhau (cùng dự đoán TAI hoặc XIU)
+           → THEO pred của 2 logic bẻ (bỏ qua logic thường).
+       2b. 2 logic bẻ KHÔNG ĐỒNG THUẬN (1 bẻ đồng pred vs logic thường,
+           BẺ2 bất đồng vs logic thường)
+           → THEO BẺ2 (logic bẻ bất đồng vs logic thường).
+
+    3. BẺ ĐỘC TÔN MẠNH (1 logic bẻ, WR bẻ > TẤT CẢ logic thuận trong top-3)
+       → THEO hoàn toàn logic bẻ (giống v19).
+
+    4. BẺ ĐỘC TÔN YẾU (1 logic bẻ, WR bẻ <= ít nhất 1 logic thuận trong top-3)
+       → THEO THIỂU SỐ:
+       - vote 2-1 → theo 1
+       - vote 3-0 → bẻ ngược
+
+    5. Không có logic bẻ (top-3 full thuận) → fallback majority + rev_ns + flip như cũ.
     """
     def _flip(v):
         return 'XIU' if v == 'TAI' else 'TAI'
 
-    group    = logic_result['group']
-    majority = logic_result['majority']
+    def _minority_vote(active_preds, majority):
+        """
+        Trả về pred theo THIỂU SỐ từ active_preds (list 3 phần tử đã effective).
+        - 2-1: thiểu số = pred khác biệt
+        - 3-0: thiểu số = đảo chiều majority
+        """
+        tai_c = active_preds.count('TAI')
+        xiu_c = active_preds.count('XIU')
+        if tai_c == 2:   # 2-1 bẻ → theo XIU (thiểu số)
+            return 'XIU'
+        if xiu_c == 2:   # 2-1 bẻ → theo TAI (thiểu số)
+            return 'TAI'
+        # 3-0 → bẻ ngược majority
+        return _flip(majority)
 
-    # v38: không bẻ — luôn theo majority + session tuner (rev_ns / flip)
-    rev_ns = _session_tuner.get('reversed_newsession', False)
-    if rev_ns:
-        pred_after_rev = _flip(majority)
-        print(f"[ENSEMBLE] {group} → ⚡ REV-NS: {majority} → {pred_after_rev}")
+    group        = logic_result['group']
+    majority     = logic_result['majority']
+    active       = logic_result['active_logics']         # e.g. ['L3', 'L4', 'L5']
+    reversed_set = set(logic_result.get('reversed_logics', []))  # e.g. {'L3'}
+    active_preds = [logic_result['L1'], logic_result['L2'], logic_result['L3']]
+    # active_preds[i] là pred (đã flip nếu reversed) của active[i]
+
+    n_be = len(reversed_set)   # số logic bẻ trong top-3
+
+    # ── CASE 1: Không có logic bẻ trong top-3 ────────────────────────────────
+    if n_be == 0:
+        # Fallback thuần: reversed_newsession + flip như v18
+        rev_ns = _session_tuner.get('reversed_newsession', False)
+        if rev_ns:
+            pred_after_rev = _flip(majority)
+            print(f"[ENSEMBLE] {group} → ⚡ REV-NS: {majority} → {pred_after_rev}")
+        else:
+            pred_after_rev = majority
+
+        flip = _session_tuner.get('flip_mode', False)
+        if flip:
+            ensemble = _flip(pred_after_rev)
+            print(f"[ENSEMBLE] {group} → 🔄 FLIP {pred_after_rev} → {ensemble}")
+        else:
+            ensemble = pred_after_rev
+            if not rev_ns:
+                print(f"[ENSEMBLE] {group} → THEO majority = {ensemble}")
+
+        return ensemble, group, False, 1.0
+
+    # ── CASE 2: Top-3 full bẻ (3 logic đều bẻ) → theo bình thường ───────────
+    if n_be == 3:
+        rev_ns = _session_tuner.get('reversed_newsession', False)
+        if rev_ns:
+            pred_after_rev = _flip(majority)
+            print(f"[ENSEMBLE] {group} → 🔁 FULL BẺ + REV-NS: {majority} → {pred_after_rev}")
+        else:
+            pred_after_rev = majority
+
+        flip = _session_tuner.get('flip_mode', False)
+        if flip:
+            ensemble = _flip(pred_after_rev)
+            print(f"[ENSEMBLE] {group} → 🔁 FULL BẺ + FLIP {pred_after_rev} → {ensemble}")
+        else:
+            ensemble = pred_after_rev
+            if not rev_ns:
+                print(f"[ENSEMBLE] {group} → 🔁 FULL BẺ (3/3) → THEO majority = {ensemble}")
+
+        return ensemble, group, False, 1.0
+
+    # ── CASE 3: Top-3 có 2 logic bẻ → theo đa số bình thường ───────────────
+    if n_be == 2:
+        tai_c    = active_preds.count('TAI')
+        xiu_c    = active_preds.count('XIU')
+        vote_str = f"{max(tai_c,xiu_c)}-{min(tai_c,xiu_c)}"
+        print(f"[ENSEMBLE] {group} → 🔁 2-BẺ → THEO ĐA SỐ (bth) "
+              f"vote={vote_str} → {majority}")
+        return majority, group, False, 1.0
+
+    # ── CASE 4 & 5: Top-3 có đúng 1 logic bẻ ────────────────────────────────
+    # n_be == 1
+    lt_bench    = _logic_tuner.get('last_bench')
+    be_dominant = False
+    dominant_pred = None
+    be_name = None
+    be_wr   = None
+    thuan_wrs = []
+
+    if lt_bench:
+        be_name   = list(reversed_set)[0]
+        eff_wr    = lt_bench.get('eff_wr', {})
+        be_wr     = eff_wr.get(be_name)
+
+        if be_wr is not None:
+            thuan_logics = [n for n in active if n not in reversed_set]
+            thuan_wrs    = [eff_wr.get(n) for n in thuan_logics if eff_wr.get(n) is not None]
+
+            # CASE 4 — BẺ ĐỘC TÔN: WR bẻ cao hơn TẤT CẢ logic thuận tối thiểu BE_DOMINANT_MIN_GAP
+            # BE_DOMINANT_MIN_GAP=0.0 → strictly >; 0.10 → phải hơn >=10% (/tinhchinh gap <số>)
+            if thuan_wrs and all(be_wr - tw > BE_DOMINANT_MIN_GAP for tw in thuan_wrs):
+                try:
+                    be_idx        = active.index(be_name)
+                    dominant_pred = active_preds[be_idx]   # đã flip sẵn
+                    be_dominant   = True
+                except (ValueError, IndexError):
+                    be_dominant = False
+
+    # CASE 4: BẺ ĐỘC TÔN — WR bẻ > cả 2 logic thuần → THEO bẻ tuyệt đối
+    if be_dominant and dominant_pred:
+        gaps = [round((be_wr - tw) * 100, 1) for tw in thuan_wrs]
+        print(f"[ENSEMBLE] {group} → 🔱 BẺ ĐỘC TÔN [{be_name} eff_wr={be_wr:.1%}] "
+              f"gap={gaps}% > thuận={[round(w*100,1) for w in thuan_wrs]}% → THEO BẺ = {dominant_pred} "
+              f"(bỏ majority={majority})")
+        return dominant_pred, group, False, 1.0
+
+    # CASE 5 — BẺ ĐỘC TÔN YẾU: WR bẻ bằng hoặc thấp hơn ≥1 logic thuần → THEO ĐA SỐ
+    # Không dùng thiểu số — tránh tình huống cả 3 vote XIU mà bẻ lại ra TAI
+    tai_c = active_preds.count('TAI')
+    xiu_c = active_preds.count('XIU')
+    vote_str = f"{max(tai_c,xiu_c)}-{min(tai_c,xiu_c)}"
+    if be_wr is not None and thuan_wrs:
+        gaps = [round((be_wr - tw) * 100, 1) for tw in thuan_wrs]
+        wr_tag = f"[{be_name} eff_wr={be_wr:.1%} gap={gaps}% — không đủ]"
     else:
-        pred_after_rev = majority
-
-    flip = _session_tuner.get('flip_mode', False)
-    if flip:
-        ensemble = _flip(pred_after_rev)
-        print(f"[ENSEMBLE] {group} → 🔄 FLIP {pred_after_rev} → {ensemble}")
-    else:
-        ensemble = pred_after_rev
-        if not rev_ns:
-            print(f"[ENSEMBLE] {group} → THEO majority = {ensemble}")
-
-    return ensemble, group, False, 1.0
+        wr_tag = f"[{be_name} — không đủ dữ liệu]"
+    print(f"[ENSEMBLE] {group} → 🔻 BẺ ĐỘC TÔN YẾU {wr_tag} → "
+          f"vote={vote_str} majority={majority} → THEO ĐA SỐ = {majority}")
+    return majority, group, False, 1.0
 
 
 def update_cross_comp(sess_id, case_type, actual_result, pred_made):
@@ -2915,17 +3238,54 @@ async def tg_poll_loop():
 
                         # ── /tinhchinh — Tinh chỉnh số ván thua liên tiếp đổi ttoan ──
                         elif cmd == '/tinhchinh':
-                            global TTOAN_CONSEC_LOSS_BAIL
+                            global TTOAN_CONSEC_LOSS_BAIL, BE_DOMINANT_MIN_GAP
                             # ── Không có arg → hiện menu ─────────────────────────────
                             if len(parts) < 2:
+                                gap_pct = round(BE_DOMINANT_MIN_GAP * 100, 1)
                                 await tg_send(chat_id,
                                     f'⚙️ <b>TINH CHỈNH — Các thông số</b>\n'
                                     f'━━━━━━━━━━━━━━\n'
                                     f'1️⃣ <b>Chuỗi thua đổi ttoan:</b> <code>{TTOAN_CONSEC_LOSS_BAIL}</code> ván\n'
                                     f'   Dùng: <code>/tinhchinh &lt;số&gt;</code>\n'
                                     f'   VD: <code>/tinhchinh 5</code>\n\n'
-                                    f'ℹ️ v38: Logic WR bẻ đã bị gỡ — top-3 chọn theo WR cao nhất thuần.\n'
+                                    f'2️⃣ <b>Gap bẻ độc tôn:</b> <code>{gap_pct}%</code>\n'
+                                    f'   WR bẻ phải hơn logic thuần ít nhất gap này mới kích hoạt bẻ\n'
+                                    f'   0% = chỉ cần strictly cao hơn | 10% = phải hơn ≥10%\n'
+                                    f'   Dùng: <code>/tinhchinh gap &lt;số&gt;</code>\n'
+                                    f'   VD: <code>/tinhchinh gap 10</code> hoặc <code>/tinhchinh gap 0</code>\n'
                                     f'<i>(Lệnh này chỉ admin thấy)</i>')
+                                continue
+
+                            # ── /tinhchinh gap <số> → đổi BE_DOMINANT_MIN_GAP ─────────
+                            if parts[1].lower() == 'gap':
+                                if len(parts) < 3:
+                                    gap_pct = round(BE_DOMINANT_MIN_GAP * 100, 1)
+                                    await tg_send(chat_id,
+                                        f'⚙️ Gap bẻ độc tôn hiện tại: <b>{gap_pct}%</b>\n'
+                                        f'Dùng: <code>/tinhchinh gap &lt;số%&gt;</code>\n'
+                                        f'VD: <code>/tinhchinh gap 10</code> → gap 10%\n'
+                                        f'    <code>/tinhchinh gap 0</code>  → chỉ cần strictly cao hơn')
+                                    continue
+                                try:
+                                    new_gap_pct = float(parts[2])
+                                    if new_gap_pct < 0 or new_gap_pct > 50:
+                                        await tg_send(chat_id, '⚠️ Gap phải trong khoảng 0–50 (%).')
+                                        continue
+                                    old_gap_pct = round(BE_DOMINANT_MIN_GAP * 100, 1)
+                                    BE_DOMINANT_MIN_GAP = new_gap_pct / 100.0
+                                    print(f"[TINHCHINH] Admin đổi BE_DOMINANT_MIN_GAP: {old_gap_pct}% → {new_gap_pct}% "
+                                          f"@ live#{app_state['live_count']}")
+                                    await tg_send(chat_id,
+                                        f'✅ <b>TINH CHỈNH GAP — Hoàn tất</b>\n'
+                                        f'━━━━━━━━━━━━━━\n'
+                                        f'Gap bẻ độc tôn:\n'
+                                        f'  Cũ: <b>{old_gap_pct}%</b>\n'
+                                        f'  Mới: <b>{new_gap_pct}%</b>\n\n'
+                                        f'⚡ Hiệu lực từ phiên kế tiếp.\n'
+                                        f'Bẻ độc tôn chỉ kích hoạt khi WR bẻ hơn logic thuần ≥<b>{new_gap_pct}%</b>\n'
+                                        f'<i>(Lệnh này chỉ admin thấy)</i>')
+                                except ValueError:
+                                    await tg_send(chat_id, '⚠️ Nhập số. VD: /tinhchinh gap 10')
                                 continue
 
                             # ── /tinhchinh <số> → đổi TTOAN_CONSEC_LOSS_BAIL ──────────
@@ -6022,8 +6382,8 @@ def create_app():
 if __name__ == '__main__':
     import threading
     print("=" * 60)
-    print("  TX v38 — 16 Logic Engine + Warmup 10 + Logic Tuner (WR thuần) + AutoLogin + AutoBet WS Real")
-    print("  + Auto Reversed Newsession | v38: BỎ logic WR bẻ — chỉ chọn WR cao nhất")
+    print("  TX v28 — 6 Logic Engine + Warmup 10 + Logic Tuner + AutoLogin + AutoBet WS Real")
+    print("  + Auto Reversed Newsession + BẺ ĐỘC TÔN + THIỂU SỐ 2-BẺ")
     print("  + TTOAN WR Switch + Last-Fail Trim (bù ván khi đổi ttoan)")
     print("  [NO CROSS-COMP] Luôn THEO majority — không bù trừ lô chéo")
     print(f"  http://localhost:{PORT}")
