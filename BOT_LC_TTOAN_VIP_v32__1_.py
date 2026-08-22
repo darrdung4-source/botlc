@@ -342,6 +342,7 @@ class AutoBetSession:
         loss_streak_reduce: int = 0,  # v31: thua N ván liên tiếp → giảm cược (0=không)
         reduced_bet: int = 0,         # v31: mức cược giảm xuống khi đủ loss_streak_reduce
         loss_x2_streak: int = 0,      # v32+: thua N ván liên tiếp → x2 cược (0=không)
+        win_x2_keep: bool = False,    # v33fix: True=tiếp tục x2 sau khi thắng; False=về cược gốc
         username: str = '',           # v34: lưu để re-login + fetch balance thực tế
         password: str = '',           # v34
     ):
@@ -355,6 +356,7 @@ class AutoBetSession:
         self.martingale         = martingale
         self.double_on_win      = double_on_win
         self.win_streak_x2      = win_streak_x2      # v31
+        self.win_x2_keep        = win_x2_keep         # v33fix: giữ x2 hay về gốc khi thắng
         self.reset_on_win       = reset_on_win
         self.double_on_loss     = double_on_loss
         self.reset_on_loss      = reset_on_loss
@@ -372,6 +374,7 @@ class AutoBetSession:
         self.pending_entry      = None
         self._is_reduced        = False  # v31: đang ở chế độ cược giảm
         self._loss_x2_triggered = False  # v32+: đang trong chuỗi x2 do thua liên tiếp
+        self._x2_active         = False  # v33fix: đang ở mức x2 do thắng liên tiếp
         # v34: balance sync
         self._bal_sync_fail     = 0      # lần fetch thất bại liên tiếp
         self._relogin_lock      = False  # tránh re-login đồng thời
@@ -398,10 +401,23 @@ class AutoBetSession:
             if self.win_streak >= threshold:
                 doubled = min(self.base_bet * 2, self.ledger.balance)
                 if self.current_bet < doubled:
+                    # Lần đầu đạt ngưỡng → x2
                     self.current_bet = doubled
+                    self._x2_active  = True
+                elif self._x2_active:
+                    # v33fix: đã đang ở mức x2 và thắng tiếp
+                    if self.win_x2_keep:
+                        # Giữ nguyên mức x2, tiếp tục cược
+                        pass
+                    else:
+                        # Về cược gốc sau khi thắng 1 ván ở mức x2
+                        self.current_bet = self.base_bet
+                        self._x2_active  = False
+                        self.win_streak  = 0
             # chưa đủ streak → giữ nguyên current_bet (không thay đổi)
         elif self.reset_on_win or self.martingale:
             self.current_bet = self.base_bet
+            self._x2_active  = False
             self.win_streak  = 0
 
     def on_loss(self):
@@ -426,8 +442,9 @@ class AutoBetSession:
             self.current_bet = max(self.reduced_bet, 1)
             return
         if self.double_on_win:
-            # double_on_win mode: thua → reset về base, clear reduced
+            # double_on_win mode: thua → reset về base, clear reduced và x2
             self._is_reduced = False
+            self._x2_active  = False
             self.current_bet = self.base_bet
         elif self.double_on_loss or self.martingale:
             self.current_bet = min(self.current_bet * 2, self.ledger.balance)
@@ -1597,14 +1614,17 @@ def logic_tuner_update_result(sess_id: str, actual: str, pred_ok: bool | None = 
             _ttoan_tracker['last_swap_reason']     = 'consec_loss'
             _logic_tuner['since_tune']             = 0
             new_top3 = _logic_tuner['active_logics']
-            asyncio.get_event_loop().create_task(
-                _tg_notify_ttoan_swap(
-                    swap_count = _ttoan_tracker['swap_count'],
-                    vans_used  = vans_done,
-                    recent_wr  = 0.0,
-                    new_logics = new_top3,
+            try:
+                asyncio.get_event_loop().create_task(
+                    _tg_notify_ttoan_swap(
+                        swap_count = _ttoan_tracker['swap_count'],
+                        vans_used  = vans_done,
+                        recent_wr  = 0.0,
+                        new_logics = new_top3,
+                    )
                 )
-            )
+            except Exception as _e:
+                print(f"[TTOAN-NOTIFY TASK ERR] {_e}")
             return
 
     # 3b. v26: FIRST-REAL-FAIL GATE
@@ -1682,14 +1702,17 @@ def logic_tuner_update_result(sess_id: str, actual: str, pred_ok: bool | None = 
               f"@ live#{app_state['live_count']} | bộ đếm reset → {trim_count} (pre-fill)")
         # Broadcast Telegram thông báo đổi ttoan + logic mới
         new_top3 = _logic_tuner['active_logics']
-        asyncio.get_event_loop().create_task(
-            _tg_notify_ttoan_swap(
-                swap_count = _ttoan_tracker['swap_count'],
-                vans_used  = vans_done,
-                recent_wr  = recent_wr,
-                new_logics = new_top3,
+        try:
+            asyncio.get_event_loop().create_task(
+                _tg_notify_ttoan_swap(
+                    swap_count = _ttoan_tracker['swap_count'],
+                    vans_used  = vans_done,
+                    recent_wr  = recent_wr,
+                    new_logics = new_top3,
+                )
             )
-        )
+        except Exception as _e:
+            print(f"[TTOAN-NOTIFY TASK ERR] {_e}")
 
     else:
         # Vùng trung tính 40%–60% → không làm gì
@@ -2498,6 +2521,44 @@ async def tg_broadcast(text: str):
     if dead:
         save_subs()
 
+async def _tg_notify_ttoan_swap(swap_count: int, vans_used: int, recent_wr: float, new_logics: list):
+    """
+    Broadcast Telegram thông báo khi ttoan tự động đổi (emergency hoặc WR-triggered).
+    Gửi đến ADMIN_ID và toàn bộ subscribers.
+    """
+    top3_str  = ' · '.join(f'<b>{l}</b>' for l in new_logics) if new_logics else '—'
+    wr_pct    = f'{recent_wr*100:.1f}%' if recent_wr > 0 else '🚨 Emergency (chuỗi sai liên tiếp)'
+    reason_str = 'WR thấp' if recent_wr > 0 else 'Sai liên tiếp quá ngưỡng'
+
+    msg = (
+        f'🔀 <b>Tự động đổi ttoan #{swap_count}</b>\n'
+        f'━━━━━━━━━━━━━━\n'
+        f'Lý do: <b>{reason_str}</b>\n'
+        f'WR {TTOAN_CHECK_WINDOW} ván cuối: <b>{wr_pct}</b>\n'
+        f'Số ván đã dùng: <b>{vans_used}</b>\n'
+        f'Logic mới: {top3_str}\n'
+        f'━━━━━━━━━━━━━━\n'
+        f'⚡ Tool đã tự chọn lại tổ hợp logic tốt nhất.'
+    )
+    # Gửi admin trước
+    await tg_send(ADMIN_ID, msg)
+    # Broadcast subscriber (trừ admin tránh gửi 2 lần)
+    for cid, info in list(tg_subscribers.items()):
+        if cid == ADMIN_ID:
+            continue
+        if not info.get('notify', True):
+            continue
+        try:
+            async with aiohttp.ClientSession() as sess_http:
+                await sess_http.post(
+                    f'{TG_API}/sendMessage',
+                    json={'chat_id': cid, 'text': msg, 'parse_mode': 'HTML'},
+                    timeout=aiohttp.ClientTimeout(total=10)
+                )
+        except Exception as e:
+            print(f"[TTOAN-NOTIFY ERR] {cid}: {e}")
+
+
 async def tg_poll_loop():
     """Long-polling Telegram updates — full command system"""
     global tg_offset
@@ -2647,13 +2708,30 @@ async def tg_poll_loop():
                                 wx2 = int(raw_txt.strip())
                                 if wx2 < 0: raise ValueError
                                 pend['win_streak_x2'] = max(wx2, 1) if wx2 > 0 else 1
-                                pend['step'] = 'await_loss_reduce'
+                                # v33fix: hỏi thêm sau khi x2 thắng → về gốc hay tiếp tục x2
+                                pend['step'] = 'await_win_x2_keep'
+                                thr = pend['win_streak_x2']
                                 await tg_send(chat_id,
-                                    '🔻 <b>Giảm cược khi thua liên tiếp?</b>\n'
-                                    'Thua bao nhiêu ván liên tiếp thì giảm cược?\n'
-                                    '(Nhập 0 nếu không muốn giảm cược):')
+                                    f'🔄 <b>Sau khi thắng ở mức X2, bạn muốn:</b>\n'
+                                    f'1️⃣ <b>Về cược gốc</b> — thắng 1 ván ở mức x2 → reset lại cược gốc, bắt đầu đếm lại\n'
+                                    f'2️⃣ <b>Tiếp tục x2</b> — giữ nguyên mức x2 cho đến khi thua\n'
+                                    f'<i>(Chế độ hiện tại: cần thắng {thr} ván liên tiếp mới lên x2)</i>\n'
+                                    f'Nhập 1 hoặc 2:')
                             except ValueError:
                                 await tg_send(chat_id, '⚠️ Nhập số nguyên ≥ 0. VD: 3')
+                            continue
+
+                        elif step == 'await_win_x2_keep':
+                            choice = raw_txt.strip()
+                            pend['win_x2_keep'] = (choice == '2')
+                            pend['step'] = 'await_loss_reduce'
+                            keep_label = 'Tiếp tục x2 cho đến khi thua' if pend['win_x2_keep'] else 'Về cược gốc sau 1 ván thắng x2'
+                            await tg_send(chat_id,
+                                f'✅ Đã chọn: <b>{keep_label}</b>\n'
+                                f'━━━━━━━━━━━━━━\n'
+                                f'🔻 <b>Giảm cược khi thua liên tiếp?</b>\n'
+                                f'Thua bao nhiêu ván liên tiếp thì giảm cược?\n'
+                                f'(Nhập 0 nếu không muốn giảm cược):')
                             continue
 
                         elif step == 'await_loss_reduce':
@@ -2742,6 +2820,7 @@ async def tg_poll_loop():
                                     martingale          = martingale,
                                     double_on_win       = pend.get('double_on_win', False),
                                     win_streak_x2       = pend.get('win_streak_x2', 0),
+                                    win_x2_keep         = pend.get('win_x2_keep', False),  # v33fix
                                     reset_on_win        = pend.get('reset_on_win', False),
                                     double_on_loss      = pend.get('double_on_loss', False),
                                     reset_on_loss       = pend.get('reset_on_loss', False),
@@ -2777,9 +2856,11 @@ async def tg_poll_loop():
                                 mode_loss = ("x2 Martingale" if pend.get('double_on_loss')
                                              else ("Reset về gốc" if pend.get('reset_on_loss')
                                              else "Giữ nguyên"))
+                                _keep = pend.get('win_x2_keep', False)
                                 if _dow:
                                     _thr  = _wx2 if _wx2 > 0 else 1
-                                    mode_win = f"x2 sau {_thr} ván thắng liên tiếp"
+                                    _keep_label = 'tiếp tục x2 cho đến khi thua' if _keep else 'về gốc sau 1 ván thắng x2'
+                                    mode_win = f"x2 sau {_thr} ván thắng liên tiếp → {_keep_label}"
                                 elif pend.get('reset_on_win'):
                                     mode_win = "Reset về gốc"
                                 else:
@@ -4411,7 +4492,8 @@ async def handle_session_result(data):
             _ab_icon = "✅" if _ab_win else "❌"
 
             if _ab_win:
-                _was_reduced = _ab_sess._is_reduced
+                _was_reduced  = _ab_sess._is_reduced
+                _was_x2       = _ab_sess._x2_active
                 _ab_sess.on_win()
                 # check profit target
                 if _ab_sess.should_stop_profit():
@@ -4429,6 +4511,18 @@ async def handle_session_result(data):
                     await tg_send(_ab_cid,
                         f'✅ <b>Đã thắng — về cược gốc!</b>\n'
                         f'Cược tiếp: <b>{_ab_sess.current_bet:,}</b>')
+                # v33fix: thắng ở mức x2 → thông báo về gốc hoặc tiếp tục x2
+                elif _was_x2 and _ab_sess.double_on_win:
+                    if not _ab_sess.win_x2_keep and not _ab_sess._x2_active:
+                        # Đã về gốc sau 1 ván thắng x2
+                        await tg_send(_ab_cid,
+                            f'🔄 <b>Thắng x2 — Về cược gốc!</b>\n'
+                            f'Cược tiếp: <b>{_ab_sess.current_bet:,}</b>')
+                    elif _ab_sess.win_x2_keep and _ab_sess._x2_active:
+                        # Vẫn giữ x2
+                        await tg_send(_ab_cid,
+                            f'📈 <b>Thắng x2 — Tiếp tục x2!</b>\n'
+                            f'Cược tiếp: <b>{_ab_sess.current_bet:,}</b>')
             else:
                 _ab_sess.on_loss()
                 # v31: vừa vào reduced mode → thông báo
