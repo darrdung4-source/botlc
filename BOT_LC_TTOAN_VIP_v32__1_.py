@@ -2523,8 +2523,8 @@ async def tg_broadcast(text: str):
 
 async def _tg_notify_ttoan_swap(swap_count: int, vans_used: int, recent_wr: float, new_logics: list):
     """
-    Broadcast Telegram thông báo khi ttoan tự động đổi (emergency hoặc WR-triggered).
-    Gửi đến ADMIN_ID và toàn bộ subscribers.
+    Thông báo khi ttoan tự động đổi (emergency hoặc WR-triggered).
+    Chỉ gửi cho ADMIN — user thường KHÔNG nhận tin nhắn này.
     """
     top3_str  = ' · '.join(f'<b>{l}</b>' for l in new_logics) if new_logics else '—'
     wr_pct    = f'{recent_wr*100:.1f}%' if recent_wr > 0 else '🚨 Emergency (chuỗi sai liên tiếp)'
@@ -2540,14 +2540,9 @@ async def _tg_notify_ttoan_swap(swap_count: int, vans_used: int, recent_wr: floa
         f'━━━━━━━━━━━━━━\n'
         f'⚡ Tool đã tự chọn lại tổ hợp logic tốt nhất.'
     )
-    # Gửi admin trước
-    await tg_send(ADMIN_ID, msg)
-    # Broadcast subscriber (trừ admin tránh gửi 2 lần)
-    for cid, info in list(tg_subscribers.items()):
-        if cid == ADMIN_ID:
-            continue
-        if not info.get('notify', True):
-            continue
+    # Chỉ gửi đến ADMIN_ID + extra_admins — KHÔNG broadcast user thường
+    admin_ids = [ADMIN_ID] + list(extra_admins.keys())
+    for cid in admin_ids:
         try:
             async with aiohttp.ClientSession() as sess_http:
                 await sess_http.post(
